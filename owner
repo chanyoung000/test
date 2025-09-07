@@ -1,0 +1,201 @@
+import os
+import re
+import time
+import traceback
+import pandas as pd
+import openpyxl
+import tkinter as tk
+from tkinter import messagebox
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+def run_automation(progress_label, filename_entry):
+    try:
+        input_csv_path = os.path.join(os.getcwd(), "input_addresses.csv")
+        save_folder = os.path.join(os.getcwd(), "find")
+        os.makedirs(save_folder, exist_ok=True)
+
+        user_filename = filename_entry.get().strip()
+        if not user_filename:
+            user_filename = "소유자조회결과"
+        if not user_filename.endswith(".xlsx"):
+            user_filename += ".xlsx"
+
+        save_path = os.path.join(save_folder, user_filename)
+
+        address_df = pd.read_csv(input_csv_path, encoding='utf-8-sig')
+        address_list = address_df.iloc[:, 0].dropna().tolist()
+
+        options = Options()
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+
+        chromedriver_path = os.path.join(os.getcwd(), "chromedriver.exe")
+        service = Service(executable_path=chromedriver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "소유자정보"
+        ws.append(["주소", "구분", "소유자", "지목", "면적", "공시지가", "지역·지구(국계법)", "지역·지구(타법령)", "추가기재사항"])
+
+        driver.get("https://kgeop.go.kr/info/infoMap.do?initMode=L")
+        wait = WebDriverWait(driver, 30)
+
+        try:
+            popup_close = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnHelpClose")))
+            popup_close.click()
+        except:
+            pass
+
+        for i, address in enumerate(address_list, 1):
+            progress_label.config(text=f"{i}/{len(address_list)} 처리 중: {address}")
+            progress_label.update()
+            try:
+                search_input = wait.until(EC.element_to_be_clickable((By.ID, "josuKeyword")))
+                search_input.clear()
+                search_input.send_keys(address)
+
+                search_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnSearch")))
+                search_button.click()
+                wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.loading.type02")))
+
+                try:
+                    total_count_el = wait.until(EC.presence_of_element_located((By.ID, "jusoTotalCount")))
+                    total_count = int(total_count_el.text.strip().replace(",", ""))
+                    if total_count == 0:
+                        ws.append([address, "검색 실패", "", "", "", "", "", "", ""])
+                        continue
+                except:
+                    ws.append([address, "검색 실패", "", "", "", "", "", "", ""])
+                    continue
+
+                try:
+                    addr_items = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.addrArea")))
+                    clicked = False
+
+                    # 입력한 주소에서 '동이름'과 '지번'을 분리
+                    dong_match = re.search(r"([가-힣]+동)", address)
+                    jibun_match = re.search(r"\d+-\d+|\d+", address)
+
+                    dong = dong_match.group(1) if dong_match else ""
+                    jibun = jibun_match.group(0) if jibun_match else ""
+
+                    for item in addr_items:
+                        jibun_el = item.find_element(By.CSS_SELECTOR, "p.jibun")
+                        jibun_text = jibun_el.text
+
+                        if dong in jibun_text and jibun in jibun_text:
+                            item.click()
+                            clicked = True
+                            break
+
+                    if not clicked:
+                        raise Exception("주소 동+지번 일치 항목 없음")
+                except:
+                    ws.append([address, "주소 클릭 실패", "", "", "", "", "", "", ""])
+                    continue
+
+                wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.loading.type02")))
+
+                try:
+                    more_info_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnMoreInfo")))
+                    more_info_btn.click()
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "tbody.shrYmbList tr")))
+                except:
+                    ws.append([address, "상세정보 클릭 실패", "", "", "", "", "", "", ""])
+                    continue
+
+                try:
+                    landuse_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.blue[onclick*='ilPilji.fnLandUsePlan']")))
+                    landuse_button.click()
+                    wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.loading.type02")))
+                    landuse_table = wait.until(EC.presence_of_element_located((By.ID, "landUsePlanTbl")))
+                    landuse_rows = landuse_table.find_elements(By.TAG_NAME, "tr")
+
+                    if len(landuse_rows) >= 6:
+                        region1 = landuse_rows[1].find_element(By.TAG_NAME, "td").text.strip()
+                        region2 = landuse_rows[3].find_element(By.TAG_NAME, "td").text.strip()
+                        region3 = landuse_rows[5].find_element(By.TAG_NAME, "td").text.strip()
+                    else:
+                      print("⚠️ 토지이용계획 테이블 구조 이상")
+                except Exception as e:
+                  print("⚠️ 토지이용계획 조회 실패")
+                  traceback.print_exc()
+
+                table_row = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "tbody.shrYmbList tr")))
+                cells = table_row.find_elements(By.TAG_NAME, "td")
+                owner_type = cells[0].text.strip()
+                owner_name = cells[1].text.strip()
+
+                land_row = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "tbody.landLedgRst tr")))
+                land_cells = land_row.find_elements(By.TAG_NAME, "td")
+                land_type = land_cells[0].text.strip()
+                land_area = land_cells[1].text.strip()
+
+                try:
+                    price_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//li[contains(text(), '가격')]")))
+                    price_tab.click()
+                    time.sleep(1)
+                except:
+                    pass
+
+                try:
+                    jiga_row = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "tbody#jigaInfoTbl tr")))
+                    jiga_cells = jiga_row.find_elements(By.TAG_NAME, "td")
+                    land_price = jiga_cells[2].text.strip()
+                except:
+                    land_price = "-"
+
+                ws.append([address, owner_type, owner_name, land_type, land_area, land_price, region1, region2, region3])
+
+            except:
+                ws.append([address, "오류", "조회 실패", "", "", "", "", "", ""])
+
+        wb.save(save_path)
+        progress_label.config(text="✅ 모든 작업 완료")
+        messagebox.showinfo("완료", f"엑셀 저장 완료: {save_path}")
+
+    except Exception as e:
+        traceback.print_exc()
+        messagebox.showerror("오류 발생", str(e))
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+def launch_gui():
+    root = tk.Tk()
+    root.title("지번 토지정보 조회 by 방찬영")
+    root.geometry("420x300")
+    root.resizable(False, False)
+
+    frame = tk.Frame(root)
+    frame.pack(expand=True)
+
+    label = tk.Label(frame, text="input_addresses.csv 파일과 chromedriver.exe를\n같은 폴더에 두고 '시작'을 누르세요", justify="center")
+    label.pack(pady=10)
+
+    filename_label = tk.Label(frame, text="저장할 파일명 입력 (확장자 제외):")
+    filename_label.pack()
+    filename_entry = tk.Entry(frame, width=30)
+    filename_entry.insert(0, "소유자조회결과")
+    filename_entry.pack(pady=5)
+
+    progress_label = tk.Label(frame, text="대기 중...", fg="blue")
+    progress_label.pack(pady=10)
+
+    start_button = tk.Button(frame, text="시작", command=lambda: run_automation(progress_label, filename_entry), height=2, width=20)
+    start_button.pack(pady=10)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    launch_gui()
