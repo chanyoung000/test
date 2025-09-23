@@ -209,7 +209,7 @@ def get_center_from_geojson(geojson):
     lons, lats = zip(*coords)
     return sum(lats) / len(lats), sum(lons) / len(lons)
 
-def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color='#FFA500', fill_color='white', fill_opacity=0.2, inner_weight=2, outer_weight=4):
+def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color='#FFA500', fill_color='white', fill_opacity=0.2):
     output_file = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML files", "*.html")],
                                                title="지도를 저장할 위치를 선택하세요")
     if not output_file:
@@ -223,7 +223,7 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
         return {
             'fillColor': 'white',
             'color': 'white',
-            'weight': inner_weight,
+            'weight': 2,
             'fillOpacity': 0.2
         }
 
@@ -243,13 +243,13 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
             return {
                 'fillColor': 'white',
                 'color': 'white',
-                'weight': inner_weight,
+                'weight': 2,
                 'fillOpacity': 0.2
             }
         return {
             'fillColor': style.get("fill", 'white'),
             'color': style.get("stroke", 'white'),
-            'weight': inner_weight,
+            'weight': 2,
             'fillOpacity': style.get("opacity", 0.2)
         }
 
@@ -271,30 +271,23 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
         ).add_to(styled_layer)
         m.add_child(styled_layer)
 
-    from collections import defaultdict
+    polys = [shape(f['geometry']) for f in geojson['features']]
     from shapely.ops import unary_union
-
-    addr_polys = defaultdict(list)
-    for f in geojson['features']:
-        addr = f.get('properties', {}).get('addr', '')
-        addr_polys[addr].append(shape(f['geometry']))
-
-    outer_layer = folium.FeatureGroup(name="주소별 외곽선")
-    outer_style = lambda x: {
-        'fillColor': 'none',
-        'color': 'white',
-        'weight': outer_weight,
-        'fillOpacity': 0
-    }
-    for polys in addr_polys.values():
-        merged = unary_union(polys)
-        merged_gdf = gpd.GeoDataFrame(geometry=[merged])
-        merged_geojson = json.loads(merged_gdf.to_json())
-        folium.GeoJson(
-            merged_geojson,
-            style_function=outer_style,
-            tooltip=None
-        ).add_to(outer_layer)
+    merged = unary_union(polys)
+    merged_gdf = gpd.GeoDataFrame(geometry=[merged])
+    merged_geojson = json.loads(merged_gdf.to_json())
+    outer_layer = folium.FeatureGroup(name="외곽선만(내부경계 없음)")
+    folium.GeoJson(
+        merged_geojson,
+        name="외곽선만(내부경계 없음)",
+        style_function=lambda x: {
+            'fillColor': 'none',
+            'color': 'white',
+            'weight': 4,
+            'fillOpacity': 0
+        },
+        tooltip=None
+    ).add_to(outer_layer)
     m.add_child(outer_layer)
 
     # 개발제한구역 WMS 레이어 추가
@@ -333,43 +326,6 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
     m.save(output_file)
     webbrowser.open(output_file)
 
-def create_outer_only_map(geojson, outer_weight=4):
-    output_file = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML files", "*.html")],
-                                               title="외곽선 지도를 저장할 위치를 선택하세요")
-    if not output_file:
-        return
-    lat, lon = get_center_from_geojson(geojson)
-    tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{vworld_key}/Satellite/{{z}}/{{y}}/{{x}}.jpeg"
-    m = folium.Map(location=[lat, lon], zoom_start=18, tiles=None)
-    folium.TileLayer(tiles=tile_url, attr='VWorld Satellite', name='위성지도', detectRetina=True).add_to(m)
-    from collections import defaultdict
-    from shapely.ops import unary_union
-
-    addr_polys = defaultdict(list)
-    for f in geojson['features']:
-        addr = f.get('properties', {}).get('addr', '')
-        addr_polys[addr].append(shape(f['geometry']))
-
-    outer_style = lambda x: {
-        'fillColor': 'none',
-        'color': 'white',
-        'weight': outer_weight,
-        'fillOpacity': 0
-    }
-    for polys in addr_polys.values():
-        merged = unary_union(polys)
-        merged_gdf = gpd.GeoDataFrame(geometry=[merged])
-        merged_geojson = json.loads(merged_gdf.to_json())
-        folium.GeoJson(
-            merged_geojson,
-            style_function=outer_style,
-            tooltip=None
-        ).add_to(m)
-    m.save(output_file)
-    webbrowser.open(output_file)
-
-
-
 def load_addresses_from_input_csv(address_list, checklist):
     base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
     csv_file = os.path.join(base_dir, "input.csv")
@@ -397,8 +353,6 @@ def run_gui():
     stroke_color_var = tk.StringVar(value="#FFA500")
     fill_color_var = tk.StringVar(value="white")
     fill_opacity_var = tk.DoubleVar(value=0.2)
-    inner_weight_var = tk.IntVar(value=2)
-    outer_weight_var = tk.IntVar(value=4)
 
     # ------ 상단 주소입력 패널 ------
     frame_top = tk.Frame(root)
@@ -464,10 +418,10 @@ def run_gui():
     btn_delete_selected.grid(row=2, column=0, padx=2, pady=2, sticky="we")
     btn_std_addr.grid(row=3, column=0, padx=2, pady=2, sticky="we")
 
-    btn_outer_map = tk.Button(frame_left, text="외곽선 지도", width=btn_width, height=btn_height)
+    btn_generate2 = tk.Button(frame_left, text="지도 생성2", width=btn_width, height=btn_height)
     btn_excel_save = tk.Button(frame_left, text="엑셀 저장", width=btn_width, height=btn_height)
 
-    btn_outer_map.grid(row=1, column=1, padx=2, pady=2, sticky="we")
+    btn_generate2.grid(row=1, column=1, padx=2, pady=2, sticky="we")
     btn_excel_save.grid(row=2, column=1, padx=2, pady=2, sticky="we")
 
     def add_addr():
@@ -532,37 +486,10 @@ def run_gui():
             address_styles,
             stroke_color=stroke_color_var.get(),
             fill_color=fill_color_var.get(),
-            fill_opacity=fill_opacity_var.get(),
-            inner_weight=inner_weight_var.get(),
-            outer_weight=outer_weight_var.get()
+            fill_opacity=fill_opacity_var.get()
         )
-
-        def generate_outer_map():
-            if not address_list:
-                messagebox.showerror("오류", "주소가 없습니다.")
-                return
-            features = []
-            for addr in address_list:
-                try:
-                    pnu = address_to_pnu(addr)
-                    gj = get_geojson_by_pnu(pnu)
-                    for f in gj['features']:
-                        if 'properties' not in f:
-                            f['properties'] = {}
-                        f['properties']['addr'] = addr
-                    features.extend(gj['features'])
-                except Exception as e:
-                    print(f"[오류] {addr}: {e}")
-            if not features:
-                messagebox.showerror("실패", "유효한 지번이 없습니다.")
-                return
-            create_outer_only_map(
-                {"type": "FeatureCollection", "features": features},
-                outer_weight=outer_weight_var.get()
-            )
-
-        btn_map.config(command=generate_map)
-        btn_outer_map.config(command=generate_outer_map)
+    btn_map.config(command=generate_map)
+    btn_generate2.config(command=generate_map)
 
     def excel_save():
         save_to_excel()
@@ -635,7 +562,7 @@ def run_gui():
     frame_right_container.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
     frame_main.grid_columnconfigure(1, weight=2)
 
-    frame_right = tk.LabelFrame(frame_right_container, text="스타일 설정", bd=2, relief="solid", height=350)
+    frame_right = tk.LabelFrame(frame_right_container, text="스타일 설정", bd=2, relief="solid", height=270)
     frame_right.pack(fill="x", pady=(0, 10))
     frame_right.pack_propagate(False)
 
@@ -647,18 +574,6 @@ def run_gui():
               command=lambda: fill_color_var.set(colorchooser.askcolor(initialcolor=fill_color_var.get())[1])).pack(pady=2)
     tk.Label(frame_right, text="채움 투명도 (0.0 ~ 1.0)").pack()
     tk.Entry(frame_right, textvariable=fill_opacity_var, width=btn_width).pack(pady=(0, 5))
-    tk.Label(frame_right, text="내부선 굵기").pack()
-    tk.Scale(
-        frame_right, from_=0, to=10,
-        orient=tk.HORIZONTAL, variable=inner_weight_var,
-        resolution=1
-    ).pack(pady=(0, 5))
-    tk.Label(frame_right, text="외곽선 굵기").pack()
-    tk.Scale(
-        frame_right, from_=1, to=10,
-        orient=tk.HORIZONTAL, variable=outer_weight_var,
-        resolution=1
-    ).pack(pady=(0, 5))
     btn_apply_style = tk.Button(frame_right, text="스타일 적용", width=btn_width, height=btn_height, command=apply_style_to_selected)
     btn_apply_style.pack(pady=6)
 
