@@ -1,0 +1,137 @@
+import pandas as pd
+import os
+
+
+# PNU의 뒷 9자리를 분석하여 지번 문자열을 생성하는 함수
+def parse_pnu_jibun(pnu_suffix):
+    """
+    PNU 코드의 뒷 9자리(토지구분, 본번 4자리, 부번 4자리)를 분석하여 지번 문자열을 생성합니다.
+    """
+    if len(pnu_suffix) != 9:
+        return ""
+
+    land_type = pnu_suffix[0]  # 1: 일반, 2: 산
+    bon_bun_str = pnu_suffix[1:5]  # 본번 4자리
+    bu_bun_str = pnu_suffix[5:9]  # 부번 4자리
+
+    # 1. 토지 구분 접두사 처리
+    land_prefix = "산 " if land_type == '2' else ""
+
+    # 2. 본번과 부번 파싱
+    # '0012'는 12로, '0000'은 0으로 변환
+    bon_bun = int(bon_bun_str)
+    bu_bun = int(bu_bun_str)
+
+    # 3. 지번 조합
+    jibun = str(bon_bun)
+    if bu_bun > 0:
+        jibun += f"-{bu_bun}"
+
+    return land_prefix + jibun
+
+
+def pnu_to_address_converter_v2(input_file_name, map_file_name, output_file_name, pnu_column_name, map_pnu_column,
+                                map_address_column):
+    """
+    PNU 코드의 앞 10자리를 사용하여 법정동명을 매핑하고, 나머지 9자리를 파싱하여 주소를 완성합니다.
+
+    :param input_file_name: PNU 코드가 포함된 사용자 입력 CSV 파일 이름 ('1.csv')
+    :param map_file_name: 법정동 코드 매핑 정보 파일 이름 ('국토교통부_법정동코드_20240805.csv')
+    :param output_file_name: 변환된 결과가 저장될 CSV 파일 이름 ('2.csv')
+    :param pnu_column_name: 입력 파일에서 PNU 코드가 있는 컬럼 이름 (예: 'PNU')
+    :param map_pnu_column: 매핑 파일에서 법정동 코드가 있는 컬럼 이름 (예: '법정동코드')
+    :param map_address_column: 매핑 파일에서 법정동명이 있는 컬럼 이름 (예: '법정동명')
+    """
+    print("--- PNU 주소 추출 작업 시작 ---")
+
+    # 파일 존재 여부 확인 (생략)
+
+    try:
+        # 1. 데이터 불러오기 및 PNU 전처리
+        input_df = pd.read_csv(input_file_name)
+
+        # PNU 코드를 문자열로 확정하고 길이가 19자리인지 확인
+        input_df[pnu_column_name] = input_df[pnu_column_name].astype(str).str.zfill(19)
+
+        # PNU 코드에서 앞 10자리(법정동코드)와 뒷 9자리(지번) 분리
+        input_df['법정동코드_10자리'] = input_df[pnu_column_name].str.slice(0, 10)
+        input_df['PNU_지번_9자리'] = input_df[pnu_column_name].str.slice(10, 19)
+
+        # 2. 법정동 코드 매핑 파일 로드
+        address_map_df = pd.read_csv(
+            map_file_name,
+            dtype={map_pnu_column: str},
+            encoding='euc-kr'
+        )
+
+        # 매핑 파일의 법정동 코드를 10자리로 사용
+        address_map_df[map_pnu_column] = address_map_df[map_pnu_column].str.slice(0, 10)
+
+        print(f"✅ 입력 파일 ({input_file_name}) 로드 완료. (총 {len(input_df)}건)")
+        print(f"✅ 법정동 매핑 파일 ({map_file_name}) 로드 완료. (총 {len(address_map_df)}건)")
+
+        # 3. 법정동 코드(10자리)를 기준으로 병합
+        merged_df = pd.merge(
+            input_df,
+            address_map_df,
+            left_on='법정동코드_10자리',
+            right_on=map_pnu_column,
+            how='left'
+        )
+
+        print(f"✅ 법정동 코드 기준 데이터 병합 완료.")
+
+        # 4. 최종 주소 조합 (법정동명 + 지번)
+        # apply 함수를 사용하여 PNU_지번_9자리를 지번 문자열로 변환
+        merged_df['지번_문자열'] = merged_df['PNU_지번_9자리'].apply(parse_pnu_jibun)
+
+        # 법정동명과 지번 문자열을 결합하여 최종 주소 컬럼 생성
+        merged_df['최종_지번주소'] = merged_df[map_address_column].fillna('주소_매핑실패') + ' ' + merged_df['지번_문자열']
+
+        # 5. 불필요한 임시 컬럼 제거 및 결과 저장
+        merged_df = merged_df.drop(columns=['법정동코드_10자리', 'PNU_지번_9자리', '지번_문자열', map_pnu_column])
+
+        merged_df.to_csv(output_file_name, index=False, encoding='utf-8-sig')
+
+        print("\n--- 작업 완료 ---")
+        print(f"🎉 주소가 추출된 파일이 **'{output_file_name}'**으로 저장되었습니다.")
+        print("결과 파일의 일부 내용 (최종_지번주소 컬럼 확인):")
+        print(merged_df[['PNU', '최종_지번주소']].head())
+
+    except KeyError as e:
+        print(f"❌ 오류: 컬럼 이름 오류 - {e}를 찾을 수 없습니다. 컬럼 이름을 정확히 확인해주세요.")
+    except Exception as e:
+        print(f"❌ 알 수 없는 오류 발생: {e}")
+
+
+# ==============================================================================
+# ⬇️ 사용자 설정 부분 (요청하신 값으로 변경) ⬇️
+# ==============================================================================
+
+# 1. PNU 코드가 들어있는 사용자의 입력 파일 이름
+INPUT_FILE = '1.csv'
+
+# 2. 전국 법정동 매핑 DB 파일 이름
+MAP_FILE = '국토교통부_법정동코드_20240805.csv'
+
+# 3. 최종 결과물이 저장될 파일 이름
+OUTPUT_FILE = '2.csv'
+
+# 4. 입력 파일('1.csv')에서 PNU 코드가 들어있는 컬럼 이름
+PNU_COLUMN = 'PNU'
+
+# 5. 매핑 파일('국토교통부...')에서 법정동 코드가 있는 컬럼 이름
+MAP_PNU_COLUMN = '법정동코드'
+
+# 6. 매핑 파일에서 법정동명이 있는 컬럼 이름
+MAP_ADDRESS_COLUMN = '법정동명'
+
+# ------------------------------------------------------------------------------
+pnu_to_address_converter_v2(
+    input_file_name=INPUT_FILE,
+    map_file_name=MAP_FILE,
+    output_file_name=OUTPUT_FILE,
+    pnu_column_name=PNU_COLUMN,
+    map_pnu_column=MAP_PNU_COLUMN,
+    map_address_column=MAP_ADDRESS_COLUMN
+)
