@@ -14,16 +14,16 @@ import openpyxl
 import urllib3
 import concurrent.futures
 import threading
-import time
-import http.server
-import socketserver
-from urllib.parse import parse_qs, urlparse
 from concurrent.futures import ThreadPoolExecutor
+import time
+from urllib.parse import parse_qs, urlparse
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ... (이하 코드 계속) ...
+
 # ====== 1. VWorld API 키 설정 ======
-if getattr(sys, 'frozen', False):
+if getattr(sys, 'frozen', False):a
     base_dir = os.path.dirname(sys.executable)
 else:
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -91,7 +91,6 @@ else:
     dong_lookup = {}
 
 excel_features = []
-data_lock = threading.Lock()
 
 
 # ====== 4. 핵심 기능 함수들 ======
@@ -101,55 +100,28 @@ def save_to_excel():
     if not excel_features:
         messagebox.showerror("오류", "저장할 데이터가 없습니다.")
         return
-
     save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")],
                                              title="엑셀 저장 위치 선택")
     if not save_path:
         return
-
-    try:
-        temp_list = []
-        seen = set()
-        for f in excel_features:
-            p = f.get("properties", {})
-            addr = p.get("addr", "")  # 지적도상 주소
-            search_input = p.get("search_input", "")  # [추가] 사용자가 검색한 값
-
-            # 중복 제거 (주소 기준)
-            if addr and addr not in seen:
-                seen.add(addr)
-                temp_list.append([
-                    p.get("addr", ""),
-                    p.get("지목", ""),
-                    p.get("면적", ""),
-                    p.get("공시지가", ""),
-                    p.get("소유구분", ""),
-                    p.get("공유인수", ""),
-                    p.get("용도지역", ""),
-                    p.get("개발제한구역", ""),
-                    p.get("기타용도지역", ""),
-                    search_input  # [추가] 맨 마지막 열에 검색값 추가
-                ])
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "지적도 정보"
-        # 헤더에도 '검색입력값' 추가
-        ws.append(["주소/PNU", "지목", "면적(평)", "공시지가(평당)", "소유구분", "공유인수", "용도지역", "개발제한구역", "기타용도지역", "검색입력값"])
-
-        for row in temp_list:
-            ws.append(row)
-
-        wb.save(save_path)
-        messagebox.showinfo("완료", f"총 {len(temp_list)}개의 데이터가 저장되었습니다.\n(중복 제거됨)")
-
-    except Exception as e:
-        messagebox.showerror("저장 오류", str(e))
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "지적도 정보"
+    ws.append(["주소/PNU", "지목", "면적(평)", "공시지가(평당)", "소유구분", "공유인수", "용도지역", "개발제한구역", "기타용도지역"])
+    for f in excel_features:
+        p = f.get("properties", {})
+        ws.append([
+            p.get("addr", ""), p.get("지목", ""), p.get("면적", ""), p.get("공시지가", ""),
+            p.get("소유구분", ""), p.get("공유인수", ""),
+            p.get("용도지역", ""), p.get("개발제한구역", ""), p.get("기타용도지역", "")
+        ])
+    wb.save(save_path)
+    messagebox.showinfo("완료", "엑셀 파일이 저장되었습니다.")
 
 
 def address_to_pnu(address: str) -> str:
     address = address.strip()
-    if re.match(r'^\d{19}$', address): return address
+    if re.match(r'^\d{19}$', address): return address  # PNU 직접 입력 시
 
     is_san = bool(re.search(r'\b산\s*\d+', address))
     match = re.search(r'(.+?(동|읍|면|리|로\s?\d+가|가\s?\d+가?))\s*(산)?\s*(\d+)-?(\d*)', address)
@@ -191,89 +163,74 @@ def address_to_pnu(address: str) -> str:
 
 
 def get_geojson_by_pnu(pnu: str):
-    max_retries = 3
-
     def get_ladfrl_details(pnu):
-        for _ in range(max_retries):
+        try:
+            url = "https://api.vworld.kr/ned/data/ladfrlList"
+            params = {"key": vworld_key, "domain": "land", "pnu": pnu, "format": "json", "numOfRows": "1",
+                      "pageNo": "1"}
+            res = requests.get(url, params=params, verify=False)
+            item = res.json().get("ladfrlVOList", {}).get("ladfrlVOList", [{}])[0]
+            area = item.get("lndpclAr", "")
+            price = item.get("pblntfPclnd", "")
             try:
-                url = "https://api.vworld.kr/ned/data/ladfrlList"
-                params = {"key": vworld_key, "domain": "land", "pnu": pnu, "format": "json", "numOfRows": "1",
-                          "pageNo": "1"}
-                res = requests.get(url, params=params, verify=False, timeout=5)
-                if res.status_code == 200:
-                    item = res.json().get("ladfrlVOList", {}).get("ladfrlVOList", [{}])[0]
-                    area = item.get("lndpclAr", "")
-                    price = item.get("pblntfPclnd", "")
-                    try:
-                        area_fmt = f"{float(area) * 0.3025:,.2f}"
-                    except:
-                        area_fmt = ""
-                    try:
-                        price_fmt = f"{float(price) / 0.3025:,.0f}"
-                    except:
-                        price_fmt = ""
-                    return {"지목": item.get("lndcgrCodeNm", ""), "면적": area_fmt, "공시지가": price_fmt,
-                            "소유구분": item.get("posesnSeCodeNm", ""), "공유인수": item.get("cnrsPsnCo", "")}
+                area_fmt = f"{float(area) * 0.3025:,.2f}"
             except:
-                time.sleep(0.5)
-        return {"지목": "", "면적": "", "공시지가": "", "소유구분": "", "공유인수": ""}
+                area_fmt = ""
+            try:
+                price_fmt = f"{float(price) / 0.3025:,.0f}"
+            except:
+                price_fmt = ""
+            return {"지목": item.get("lndcgrCodeNm", ""), "면적": area_fmt, "공시지가": price_fmt,
+                    "소유구분": item.get("posesnSeCodeNm", ""), "공유인수": item.get("cnrsPsnCo", "")}
+        except:
+            return {"지목": "", "면적": "", "공시지가": "", "소유구분": "", "공유인수": ""}
 
     def get_landuse_from_vworld(pnu):
-        for _ in range(max_retries):
-            try:
-                CORE_ZONES = ["제1종전용주거지역", "제2종전용주거지역", "제1종일반주거지역", "제2종일반주거지역", "제3종일반주거지역", "준주거지역", "중심상업지역",
-                              "일반상업지역", "근린상업지역", "유통상업지역", "전용공업지역", "일반공업지역", "준공업지역", "보전녹지지역", "생산녹지지역", "자연녹지지역",
-                              "보전관리지역", "생산관리지역", "계획관리지역", "농림지역", "자연환경보전지역"]
-                url = "https://api.vworld.kr/ned/wfs/getLandUseWFS"
-                params = {"key": vworld_key, "domain": "landuse", "typename": "dt_d154", "pnu": pnu,
-                          "maxFeatures": "10", "resultType": "results", "srsName": "EPSG:4326",
-                          "output": "application/json"}
-                res = requests.get(url, params=params, verify=False, timeout=5)
-                if res.status_code == 200:
-                    full_text = ""
-                    features = res.json().get("features", [])
-                    if features: full_text = features[0].get("properties", {}).get("prpos_area_dstrc_nm_list", "")
-
-                    is_greenbelt = "개발제한구역" in full_text
-                    greenbelt_val = "개발제한구역" if is_greenbelt else ""
-
-                    items = [x.strip() for x in full_text.split(',')]
-                    core_list = [];
-                    other_list = []
-                    for item in items:
-                        is_core = False
-                        for core in CORE_ZONES:
-                            if core in item: core_list.append(core); is_core = True; break
-                        if not is_core and item:
-                            if "개발제한구역" not in item: other_list.append(item)
-                    return {"용도지역": ",".join(core_list), "개발제한구역": greenbelt_val, "기타용도지역": ",".join(other_list)}
-            except:
-                time.sleep(0.5)
-        return {"용도지역": "", "개발제한구역": "", "기타용도지역": ""}
-
-    for _ in range(max_retries):
         try:
-            url = "http://api.vworld.kr/req/data"
-            params = {"service": "data", "request": "GetFeature", "key": vworld_key, "data": "LP_PA_CBND_BUBUN",
-                      "attrFilter": f"pnu:=:{pnu}", "format": "json", "crs": "EPSG:4326"}
-            res = requests.get(url, params=params, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                features = (data.get("features") or data.get("result", {}).get("featureCollection", {}).get(
-                    "features") or data.get("response", {}).get("result", {}).get("featureCollection", {}).get(
-                    "features"))
-                if features:
-                    luris_info = get_landuse_from_vworld(pnu)
-                    lad_info = get_ladfrl_details(pnu)
-                    for f in features:
-                        if "properties" not in f: f["properties"] = {}
-                        f["properties"].update(luris_info)
-                        f["properties"].update(lad_info)
-                    return {"type": "FeatureCollection", "features": features}
-        except:
-            time.sleep(1)
+            CORE_ZONES = ["제1종전용주거지역", "제2종전용주거지역", "제1종일반주거지역", "제2종일반주거지역", "제3종일반주거지역", "준주거지역", "중심상업지역", "일반상업지역",
+                          "근린상업지역", "유통상업지역", "전용공업지역", "일반공업지역", "준공업지역", "보전녹지지역", "생산녹지지역", "자연녹지지역", "보전관리지역",
+                          "생산관리지역", "계획관리지역", "농림지역", "자연환경보전지역"]
+            url = "https://api.vworld.kr/ned/wfs/getLandUseWFS"
+            params = {"key": vworld_key, "domain": "landuse", "typename": "dt_d154", "pnu": pnu, "maxFeatures": "10",
+                      "resultType": "results", "srsName": "EPSG:4326", "output": "application/json"}
+            res = requests.get(url, params=params, verify=False)
+            full_text = ""
+            features = res.json().get("features", [])
+            if features: full_text = features[0].get("properties", {}).get("prpos_area_dstrc_nm_list", "")
 
-    raise ValueError("GeoJSON 정보 없음 (재시도 실패)")
+            is_greenbelt = "개발제한구역" in full_text
+            greenbelt_val = "O" if is_greenbelt else ""
+            items = [x.strip() for x in full_text.split(',')]
+            core_list = []
+            other_list = []
+            for item in items:
+                is_core = False
+                for core in CORE_ZONES:
+                    if core in item:
+                        core_list.append(core)
+                        is_core = True;
+                        break
+                if not is_core and item:
+                    if "개발제한구역" not in item: other_list.append(item)
+            return {"용도지역": ",".join(core_list), "개발제한구역": greenbelt_val, "기타용도지역": ",".join(other_list)}
+        except Exception as e:
+            return {"용도지역": "Error", "개발제한구역": "", "기타용도지역": str(e)}
+
+    url = "http://api.vworld.kr/req/data"
+    params = {"service": "data", "request": "GetFeature", "key": vworld_key, "data": "LP_PA_CBND_BUBUN",
+              "attrFilter": f"pnu:=:{pnu}", "format": "json", "crs": "EPSG:4326"}
+    res = requests.get(url, params=params)
+    data = res.json()
+    features = (data.get("features") or data.get("result", {}).get("featureCollection", {}).get("features") or data.get(
+        "response", {}).get("result", {}).get("featureCollection", {}).get("features"))
+    if not features: raise ValueError("GeoJSON 정보 없음")
+    luris_info = get_landuse_from_vworld(pnu)
+    lad_info = get_ladfrl_details(pnu)
+    for f in features:
+        if "properties" not in f: f["properties"] = {}
+        f["properties"].update(luris_info)
+        f["properties"].update(lad_info)
+    return {"type": "FeatureCollection", "features": features}
 
 
 def get_center_from_geojson(geojson):
@@ -282,64 +239,21 @@ def get_center_from_geojson(geojson):
     return sum(lats) / len(lats), sum(lons) / len(lons)
 
 
-# ====== 프록시 핸들러 ======
-class ProxyRequestHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.startswith('/proxy?url='):
-            try:
-                parsed = urlparse(self.path)
-                qs = parse_qs(parsed.query)
-                target_url = qs.get('url', [None])[0]
-                if target_url:
-                    resp = requests.get(target_url, verify=False)
-                    self.send_response(resp.status_code)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(resp.content)
-                else:
-                    self.send_error(400, "Missing URL")
-            except Exception as e:
-                self.send_error(500, str(e))
-            return
-        super().do_GET()
-
-
-def open_html_in_server(filepath):
-    directory = os.path.dirname(filepath)
-    filename = os.path.basename(filepath)
-    port = 8000
-    server = None
-    for p in range(8000, 8020):
-        try:
-            handler = lambda *args: ProxyRequestHandler(*args, directory=directory)
-            server = socketserver.TCPServer(("127.0.0.1", p), handler)
-            port = p
-            break
-        except OSError:
-            continue
-    if not server:
-        messagebox.showerror("오류", "사용 가능한 포트를 찾을 수 없습니다.")
-        return
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    webbrowser.open(f"http://127.0.0.1:{port}/{filename}")
-
-
-# ====== 5. 지도 생성 함수 ======
+# ====== 5. 지도 생성 함수 (정적 파일 생성 방식 - 서버 X) ======
 def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color='#FFA500', fill_color='#ffffff',
-                                           fill_opacity=0.2, stroke_weight=2):
+                                           fill_opacity=0.2):
     output_file = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML files", "*.html")],
                                                title="지도를 저장할 위치를 선택하세요")
     if not output_file:
         return
 
+    # 기본값: 성남시 분당구 정자동 4-5
     if not geojson['features']:
         lat, lon = 37.361446, 127.111488
     else:
         lat, lon = get_center_from_geojson(geojson)
 
     m = folium.Map(location=[lat, lon], zoom_start=18, tiles=None)
-
     tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{vworld_key}/Satellite/{{z}}/{{y}}/{{x}}.jpeg"
     folium.TileLayer(tiles=tile_url, attr='VWorld Satellite', name='위성지도', detectRetina=True).add_to(m)
 
@@ -352,8 +266,8 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
             name="개별필지_컨트롤타겟",
             style_function=style_function,
             tooltip=folium.GeoJsonTooltip(
-                fields=['addr', '지목', '면적', '공시지가', '소유구분', '공유인수', '용도지역', '개발제한구역', '기타용도지역', 'search_input'],
-                aliases=['주소', '지목', '면적(평)', '공시지가(평당)', '소유구분', '공유인수', '용도지역', '개발제한구역', '기타용도지역', '검색입력값']
+                fields=['addr', '지목', '면적', '공시지가', '소유구분', '공유인수', '용도지역', '개발제한구역', '기타용도지역'],
+                aliases=['주소', '지목', '면적(평)', '공시지가(평당)', '소유구분', '공유인수', '용도지역', '개발제한구역', '기타용도지역']
             )
         ).add_to(m)
 
@@ -379,239 +293,52 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
 
     folium.LayerControl(position='topleft', collapsed=True).add_to(m)
 
-    js_vworld_key = vworld_key
-
+    # HTML 컨트롤 패널 (JS 제거 - 보안 이슈 방지)
     control_html = f"""
-    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
     <div id="ui-controls" style="
-        position: fixed; top: 10px; right: 10px; width: 320px;
+        position: fixed; top: 10px; right: 10px; width: 250px;
         background-color: white; padding: 15px; border: 2px solid black;
-        z-index: 9999; font-family: sans-serif; box-shadow: 3px 3px 5px rgba(0,0,0,0.3); border-radius: 8px;
-        max-height: 90vh; overflow-y: auto;">
+        z-index: 9999; font-family: sans-serif; box-shadow: 3px 3px 5px rgba(0,0,0,0.3); border-radius: 8px;">
 
-        <h4 style="margin-top:0; margin-bottom:10px;">🛠️ 지도 & 분석 도구</h4>
-
-        <div style="background:#f9f9f9; padding:10px; border-radius:5px; border:1px solid #ddd; margin-bottom:15px;">
-            <label style="font-size:12px; font-weight:bold;">📍 주소/PNU 추가 검색</label><br>
-            <input type="text" id="newAddrInput" placeholder="예: 정자동 4-5" style="width:65%; margin-top:5px;">
-            <button onclick="addNewAddress()" style="width:30%; background:#2196F3; color:white; border:none; cursor:pointer;">검색</button>
-            <div id="addStatus" style="font-size:12px; color:#333; margin-top:8px; font-weight:bold; min-height:20px; word-break: break-all;"></div>
-            <button onclick="exportToExcel()" style="width:100%; margin-top:10px; padding:8px; background:#4CAF50; color:white; border:none; font-weight:bold; cursor:pointer;">📥 조회 목록 엑셀 다운로드</button>
-            <div style="margin-top:8px; font-size:11px; color:gray;">📋 상세 로그:</div>
-            <div id="debugLog" style="font-size:10px; color:#555; margin-top:3px; height: 80px; overflow-y: scroll; border: 1px solid #ccc; background: #fff; padding: 5px; white-space: pre-wrap;">대기 중...</div>
+        <h4 style="margin-top:0; margin-bottom:10px;">🛠️ 지도 도구</h4>
+        <div style="font-size:12px; color:gray; margin-bottom:10px;">
+            * 보안상의 이유로 주소 추가는 <br>프로그램에서 진행해주세요.
         </div>
 
-        <div id="selectionStatus" style="background: #eee; padding: 8px; margin-bottom: 10px; border-radius: 4px; font-size: 13px; font-weight: bold; color: #333;">현재: 전체 필지 수정 중</div>
-        <button onclick="resetSelection()" style="width:100%; padding:5px; margin-bottom:10px; background:#f44336; color:white; border:none; border-radius:4px; cursor:pointer;">전체 모드로 복귀</button>
-        <hr style="margin-bottom:10px;">
-
         <label style="font-size:12px;"><b>선 색상</b></label>
-        <input type="color" id="strokeColor" value="{stroke_color}" style="width:40px; float:right; cursor:pointer;"><br style="clear:both; margin-bottom:5px;">
-        <label style="font-size:12px;"><b>선 두께: <span id="weightVal">{stroke_weight}</span>px</b></label>
-        <input type="range" id="strokeWeight" min="0" max="10" step="1" value="{stroke_weight}" style="width:100%; cursor:pointer;" oninput="document.getElementById('weightVal').innerText=this.value"><br>
+        <input type="color" id="strokeColor" value="{stroke_color}" style="width:100%; height:30px; cursor:pointer;"><br><br>
         <label style="font-size:12px;"><b>채움 색상</b></label>
-        <input type="color" id="fillColor" value="{fill_color}" style="width:40px; float:right; cursor:pointer;"><br style="clear:both; margin-bottom:5px;">
-        <label style="font-size:12px;"><b>불투명도: <span id="opVal">{fill_opacity}</span></b></label>
-        <input type="range" id="fillOpacity" min="0" max="1" step="0.1" value="{fill_opacity}" style="width:100%; cursor:pointer;" oninput="document.getElementById('opVal').innerText=this.value">
+        <input type="color" id="fillColor" value="{fill_color}" style="width:100%; height:30px; cursor:pointer;"><br><br>
+        <label style="font-size:12px;"><b>투명도</b></label>
+        <input type="range" id="fillOpacity" min="0" max="1" step="0.1" value="{fill_opacity}" style="width:100%; cursor:pointer;">
         <br><br>
         <button onclick="updateMapStyle()" style="width:100%; padding:10px; background:#4CAF50; color:white; border:none; border-radius:4px; font-weight:bold; cursor:pointer;">스타일 적용하기</button>
     </div>
 
     <script>
-        var selectedLayer = null; 
-        var vworldKey = "{js_vworld_key}"; 
-        var collectedData = [];
-        var CORE_ZONES = ["제1종전용주거지역", "제2종전용주거지역", "제1종일반주거지역", "제2종일반주거지역", "제3종일반주거지역", "준주거지역", "중심상업지역", "일반상업지역", "근린상업지역", "유통상업지역", "전용공업지역", "일반공업지역", "준공업지역", "보전녹지지역", "생산녹지지역", "자연녹지지역", "보전관리지역", "생산관리지역", "계획관리지역", "농림지역", "자연환경보전지역"];
-
-        window.onload = function() {{ 
-            initLayerClicks(); 
-            log("시스템 준비 완료.");
-        }};
-
-        function log(msg) {{
-            var logBox = document.getElementById('debugLog');
-            var time = new Date().toLocaleTimeString();
-            logBox.innerHTML += "[" + time + "] " + msg + "\\n";
-            logBox.scrollTop = logBox.scrollHeight;
-        }}
-
-        function findMapInstance() {{
-            for (var key in window) {{ if (window[key] instanceof L.Map) return window[key]; }}
-            return null;
-        }}
-
-        function exportToExcel() {{
-            if (collectedData.length === 0) {{ alert("저장할 데이터가 없습니다."); return; }}
-            var ws = XLSX.utils.json_to_sheet(collectedData);
-            var wb = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(wb, ws, "지적도_데이터");
-            XLSX.writeFile(wb, "지적도_분석결과.xlsx");
-            log("💾 엑셀 저장 완료!");
-        }}
-
-        function requestJSONP(url, callback) {{
-            var callbackName = 'cb_' + Math.round(100000 * Math.random());
-            var script = document.createElement('script');
-            window[callbackName] = function(data) {{
-                delete window[callbackName];
-                document.body.removeChild(script);
-                callback(data);
-            }};
-            script.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'callback=' + callbackName;
-            document.body.appendChild(script);
-        }}
-
-        function requestProxy(targetUrl, callback) {{
-            var proxyUrl = "/proxy?url=" + encodeURIComponent(targetUrl);
-            fetch(proxyUrl)
-            .then(response => {{ if (!response.ok) throw new Error("Proxy Error"); return response.json(); }})
-            .then(data => callback(data))
-            .catch(error => {{ log("❌ 통신 오류: " + error); document.getElementById('addStatus').innerHTML = "<span style='color:red;'>통신 실패</span>"; }});
-        }}
-
-        function addNewAddress() {{
-            var addr = document.getElementById('newAddrInput').value.trim();
-            if (!addr) {{ log("⚠️ 입력 필요"); return; }}
-            document.getElementById('debugLog').innerHTML = ""; 
-            var statusDiv = document.getElementById('addStatus');
-            statusDiv.innerHTML = "🔍 검색 중...";
-
-            if (/^\\d{{19}}$/.test(addr)) {{
-                log("PNU 직접 입력 감지");
-                processPNU(addr, addr, statusDiv);
-            }} else {{
-                var searchUrl = "https://api.vworld.kr/req/search?service=search&request=search&version=2.0&crs=EPSG:4326&size=1&page=1&query=" + encodeURIComponent(addr) + "&type=address&category=parcel&format=json&errorformat=json&key=" + vworldKey;
-                requestJSONP(searchUrl, function(data) {{
-                    if (data.response.status !== "OK" || data.response.result.items.length === 0) {{
-                        statusDiv.innerHTML = "<span style='color:red;'>주소 없음</span>";
-                        log("결과 없음.");
-                        return;
-                    }}
-                    var pnu = data.response.result.items[0].id;
-                    processPNU(pnu, addr, statusDiv);
-                }});
-            }}
-        }}
-
-        function processPNU(pnu, addrLabel, statusDiv) {{
-            statusDiv.innerHTML = "✅ PNU 확보<br>📡 정보 조회 중...";
-            log("PNU: " + pnu);
-
-            var ladUrl = "https://api.vworld.kr/ned/data/ladfrlList?key=" + vworldKey + "&domain=land&pnu=" + pnu + "&format=json&numOfRows=1&pageNo=1";
-            requestProxy(ladUrl, function(ladData) {{
-                var jimok = "-"; var areaStr = "-"; var priceStr = "-";
-                if(ladData.ladfrlVOList && ladData.ladfrlVOList.ladfrlVOList && ladData.ladfrlVOList.ladfrlVOList.length > 0) {{
-                    var landInfo = ladData.ladfrlVOList.ladfrlVOList[0];
-                    jimok = landInfo.lndcgrCodeNm || "-";
-                    var areaVal = parseFloat(landInfo.lndpclAr);
-                    if (!isNaN(areaVal)) areaStr = (areaVal * 0.3025).toLocaleString(undefined, {{maximumFractionDigits: 2}}) + "평";
-                    var priceVal = parseFloat(landInfo.pblntfPclnd);
-                    if (!isNaN(priceVal)) priceStr = Math.round(priceVal / 0.3025).toLocaleString() + "원";
-                }}
-
-                var useUrl = "https://api.vworld.kr/ned/wfs/getLandUseWFS?key=" + vworldKey + "&domain=landuse&typename=dt_d154&pnu=" + pnu + "&maxFeatures=10&resultType=results&srsName=EPSG:4326&output=application/json";
-                requestProxy(useUrl, function(useData) {{
-                    var zoneName = "-"; var greenbeltStr = ""; var otherZones = "-";
-                    if (useData.features && useData.features.length > 0) {{
-                        var fullText = useData.features[0].properties.prpos_area_dstrc_nm_list || "";
-                        if (fullText.indexOf("개발제한구역") !== -1) greenbeltStr = "개발제한구역";
-                        var items = fullText.split(",").map(function(s) {{ return s.trim(); }});
-                        var matchedZones = []; var others = [];
-                        items.forEach(function(item) {{
-                            var isCore = false;
-                            for (var i = 0; i < CORE_ZONES.length; i++) {{
-                                if (item.includes(CORE_ZONES[i])) {{ matchedZones.push(CORE_ZONES[i]); isCore = true; break; }}
-                            }}
-                            if (!isCore && !item.includes("개발제한구역") && item.length > 0) others.push(item);
-                        }});
-                        if (matchedZones.length > 0) zoneName = matchedZones.join(", "); else zoneName = "기타/미지정";
-                        if (others.length > 0) otherZones = others.join(", ");
-                    }} 
-
-                    var dataUrlPNU = "https://api.vworld.kr/req/data?service=data&request=GetFeature&data=LP_PA_CBND_BUBUN&key=" + vworldKey + "&attrFilter=pnu:=:" + pnu + "&format=json&crs=EPSG:4326";
-                    requestProxy(dataUrlPNU, function(geojson) {{
-                        if (geojson.response.result && geojson.response.result.featureCollection.features) {{
-                            drawFeature(geojson.response.result.featureCollection.features[0], addrLabel, jimok, areaStr, priceStr, zoneName, greenbeltStr, otherZones, statusDiv);
-                        }} else {{
-                            statusDiv.innerHTML = "<span style='color:red;'>형상 없음</span>";
-                            log("최종 실패.");
-                        }}
-                    }});
-                }});
-            }});
-        }}
-
-        function drawFeature(feature, addr, jimok, area, price, zone, greenbelt, others, statusDiv) {{
-            feature.properties.addr = addr + " (추가됨)";
-            feature.properties.지목 = jimok;
-            feature.properties.면적 = area;
-            feature.properties.공시지가 = price;
-            feature.properties.용도지역 = zone;
-            feature.properties.개발제한구역 = greenbelt;
-            feature.properties.기타용도지역 = others;
-            feature.properties.search_input = addr; // [추가됨] HTML 엑셀용
-
-            collectedData.push({{ 
-                "주소/PNU": addr, 
-                "지목": jimok, 
-                "면적(평)": area, 
-                "공시지가(평당)": price, 
-                "용도지역": zone, 
-                "개발제한구역": greenbelt, 
-                "기타규제": others,
-                "검색입력값": addr 
-            }});
-
-            var map = findMapInstance();
-            var weightVal = parseInt(document.getElementById('strokeWeight').value);
-            var newLayer = L.geoJSON(feature, {{
-                style: {{
-                    fillColor: document.getElementById('fillColor').value,
-                    color: document.getElementById('strokeColor').value,
-                    weight: weightVal,
-                    fillOpacity: parseFloat(document.getElementById('fillOpacity').value)
-                }},
-                onEachFeature: function(feature, layer) {{
-                    var p = feature.properties;
-                    var gbStyle = (p.개발제한구역 && p.개발제한구역.includes("개발제한구역")) ? "color:red; font-weight:bold;" : "";
-                    var tooltipContent = "<div style='text-align:left; font-size:12px;'>" + "<b>" + (p.addr || addr) + "</b><br>" + "지목: " + (p.지목 || "-") + "<br>" + "면적: " + (p.면적 || "-") + "<br>" + "공시지가: " + (p.공시지가 || "-") + " (평당)<br>" + "용도: <span style='color:blue; font-weight:bold;'>" + (p.용도지역 || "-") + "</span><br>" + "개발제한: <span style='" + gbStyle + "'>" + (p.개발제한구역 || "-") + "</span><br>" + "기타: " + (p.기타용도지역 || "-") + "</div>";
-                    layer.bindTooltip(tooltipContent);
-                    layer.on('click', function(e) {{ selectedLayer = e.target; document.getElementById('selectionStatus').innerHTML = "현재: <span style='color:blue;'>" + (p.addr || "추가된 필지") + "</span> 수정 중"; document.getElementById('selectionStatus').style.background = "#e3f2fd"; L.DomEvent.stopPropagation(e); }});
-                }}
-            }}).addTo(map);
-            var bounds = newLayer.getBounds();
-            map.fitBounds(bounds);
-            statusDiv.innerHTML = "<span style='color:green;'>🎉 추가 완료!</span>";
-            log("지도에 추가됨.");
-        }}
-
-        function initLayerClicks() {{
-            var mapInstance = findMapInstance();
-            if (!mapInstance) {{ setTimeout(initLayerClicks, 500); return; }}
-            mapInstance.eachLayer(function(layer) {{
-                if (layer.feature && layer.setStyle) {{
-                    if (layer.options && layer.options.fillOpacity !== 0) {{
-                        layer.on('click', function(e) {{ selectedLayer = e.target; var props = selectedLayer.feature.properties; var addr = props.addr || "선택된 필지"; document.getElementById('selectionStatus').innerHTML = "현재: <span style='color:blue;'>" + addr + "</span> 수정 중"; document.getElementById('selectionStatus').style.background = "#e3f2fd"; L.DomEvent.stopPropagation(e); }});
-                    }}
-                }}
-            }});
-        }}
-
-        function resetSelection() {{ selectedLayer = null; document.getElementById('selectionStatus').innerHTML = "현재: 전체 필지 수정 중"; document.getElementById('selectionStatus').style.background = "#eee"; }}
-
         function updateMapStyle() {{
             var stroke = document.getElementById('strokeColor').value;
             var fill = document.getElementById('fillColor').value;
             var opacity = parseFloat(document.getElementById('fillOpacity').value);
-            var weight = parseInt(document.getElementById('strokeWeight').value);
-            if (selectedLayer) {{ selectedLayer.setStyle({{ color: stroke, weight: weight, fillColor: fill, fillOpacity: opacity }}); }} else {{ var mapInstance = findMapInstance(); if (!mapInstance) return; mapInstance.eachLayer(function(layer) {{ if (layer.feature && layer.setStyle) {{ if (layer.options && layer.options.fillOpacity !== 0) {{ layer.setStyle({{ color: stroke, weight: weight, fillColor: fill, fillOpacity: opacity }}); }} }} }}); }}
+
+            var mapInstance = null;
+            for (var key in window) {{ if (window[key] instanceof L.Map) mapInstance = window[key]; }}
+            if (!mapInstance) return;
+
+            mapInstance.eachLayer(function(layer) {{
+                if (layer.feature && layer.setStyle) {{
+                    if (layer.options && layer.options.fillOpacity !== 0) {{
+                        layer.setStyle({{ color: stroke, fillColor: fill, fillOpacity: opacity }});
+                    }}
+                }}
+            }});
         }}
     </script>
     """
-
     m.get_root().html.add_child(folium.Element(control_html))
+
     m.save(output_file)
-    open_html_in_server(output_file)
+    webbrowser.open(output_file)
 
 
 def load_addresses_from_input_csv(address_list, checklist):
@@ -634,7 +361,7 @@ def load_addresses_from_input_csv(address_list, checklist):
 
 def run_gui():
     root = tk.Tk()
-    root.title("지적도 GUI by chanyoung")
+    root.title("지적도 GUI 최종 통합본 (서버프리/보안우회)")
     root.geometry("970x570")
 
     address_list = []
@@ -643,7 +370,6 @@ def run_gui():
     stroke_color_var = tk.StringVar(value="#FFA500")
     fill_color_var = tk.StringVar(value="#ffffff")
     fill_opacity_var = tk.DoubleVar(value=0.2)
-    stroke_weight_var = tk.IntVar(value=2)
 
     frame_top = tk.Frame(root)
     frame_top.pack(fill="x", padx=10, pady=5)
@@ -810,22 +536,18 @@ def run_gui():
     tk.Button(frame_right, text="선 색상 선택", width=btn_width, height=1,
               command=lambda: stroke_color_var.set(colorchooser.askcolor(initialcolor=stroke_color_var.get())[1])).pack(
         pady=2)
-
-    tk.Label(frame_right, text="개별선 굵기 (0~10)").pack()
-    tk.Scale(frame_right, from_=0, to=10, orient="horizontal", variable=stroke_weight_var, length=140).pack(pady=(0, 5))
-
     tk.Label(frame_right, text="채움 색상").pack()
     tk.Button(frame_right, text="채움 색상 선택", width=btn_width, height=1,
               command=lambda: fill_color_var.set(colorchooser.askcolor(initialcolor=fill_color_var.get())[1])).pack(
         pady=2)
-    tk.Label(frame_right, text="채움 불투명도 (0.0 ~ 1.0)").pack()
+    tk.Label(frame_right, text="채움 투명도 (0.0 ~ 1.0)").pack()
     tk.Entry(frame_right, textvariable=fill_opacity_var, width=btn_width).pack(pady=(0, 5))
     tk.Button(frame_right, text="선택 주소 스타일 적용", width=btn_width, height=btn_height,
               command=apply_style_to_selected).pack(pady=6)
 
     frame_guide = tk.LabelFrame(frame_right_container, text="사용법", bd=2, relief="solid", height=80)
     frame_guide.pack(fill="both", expand=True)
-    tk.Label(frame_guide, text="[대용량 안전모드]\n1. 10개씩 천천히 조회합니다 (API 차단 방지)\n2. 누락 시 3번 재시도합니다.\n3. 저장 시 중복을 자동 제거합니다.",
+    tk.Label(frame_guide, text="1. 주소 입력 -> 지도 생성\n2. 회사 보안상 HTML내 주소 검색은 제거됨\n3. 모든 검색은 프로그램 내에서 해주세요.",
              justify="left").pack(anchor="w", padx=10, pady=5)
 
     def process_address_worker(addr):
@@ -836,13 +558,13 @@ def run_gui():
             for f in gj["features"]:
                 if "properties" not in f: f["properties"] = {}
                 f["properties"]["addr"] = addr
-                f["properties"]["search_input"] = addr  # [중요] 검색값 저장
                 processed.append(f)
             return processed
         except:
             return []
 
     def run_process(mode="map"):
+        # 지도 모드는 주소 없어도 실행 가능
         if not address_list and mode == "excel":
             messagebox.showerror("오류", "주소가 없습니다.")
             return
@@ -852,62 +574,50 @@ def run_gui():
         progress_win.title(title_text)
         progress_win.geometry("400x150")
 
-        lbl_status = tk.Label(progress_win, text=f"총 {len(address_list)}개 처리 시작 (안전모드)...")
+        lbl_status = tk.Label(progress_win, text=f"총 {len(address_list)}개 처리 시작...")
         lbl_status.pack(pady=10)
         progress_bar = ttk.Progressbar(progress_win, maximum=len(address_list), length=300, mode="determinate")
         progress_bar.pack(pady=10)
 
         def run_thread():
-            global excel_features
-
-            with data_lock:
-                excel_features = []
-
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                future_to_addr = {executor.submit(process_address_worker, addr): addr for addr in address_list}
-
-                count = 0
-                for future in concurrent.futures.as_completed(future_to_addr):
-                    if not progress_win.winfo_exists(): break
-
-                    try:
-                        res = future.result()
-                        if res:
-                            with data_lock:
-                                excel_features.extend(res)
-                    except Exception:
-                        pass
-
-                    count += 1
-                    try:
-                        progress_bar["value"] = count
-                        if count % 10 == 0 or count == len(address_list):
-                            lbl_status.config(
-                                text=f"진행: {count} / {len(address_list)} ({(count / len(address_list)) * 100:.1f}%)")
-                        progress_win.update_idletasks()
-                    except:
-                        pass
+            features = []
+            if address_list:
+                with ThreadPoolExecutor(max_workers=20) as executor:
+                    future_to_addr = {executor.submit(process_address_worker, addr): addr for addr in address_list}
+                    count = 0
+                    for future in concurrent.futures.as_completed(future_to_addr):
+                        if not progress_win.winfo_exists(): break
+                        if res := future.result(): features.extend(res)
+                        count += 1
+                        try:
+                            progress_bar["value"] = count
+                            lbl_status.config(text=f"진행: {count}/{len(address_list)}")
+                            progress_win.update_idletasks()
+                        except:
+                            pass
 
             if not progress_win.winfo_exists(): return
             progress_win.destroy()
 
-            if not excel_features and mode == "excel":
+            if mode == "excel" and not features:
                 messagebox.showerror("실패", "유효한 데이터를 가져오지 못했습니다.")
                 return
 
+            global excel_features
+            excel_features = features.copy()
+
             if mode == "map":
-                features_collection = {"type": "FeatureCollection", "features": excel_features}
-                messagebox.showinfo("완료", f"총 {len(excel_features)}개 필지 조회 성공.\n지도를 생성합니다.")
+                features_collection = {"type": "FeatureCollection", "features": features}
+                messagebox.showinfo("완료", "지도가 생성되었습니다. (보안 문제 없음)")
                 root.after(0, lambda: create_map_with_outer_and_inner_layers(
                     features_collection,
                     address_styles,
                     stroke_color=stroke_color_var.get(),
                     fill_color=fill_color_var.get(),
-                    fill_opacity=fill_opacity_var.get(),
-                    stroke_weight=stroke_weight_var.get()
+                    fill_opacity=fill_opacity_var.get()
                 ))
             else:
-                messagebox.showinfo("완료", f"수집 완료! (총 {len(excel_features)}건)\n저장할 위치를 선택하세요.")
+                messagebox.showinfo("완료", "수집 완료! 저장할 위치를 선택하세요.")
                 root.after(0, save_to_excel)
 
         threading.Thread(target=run_thread, daemon=True).start()
