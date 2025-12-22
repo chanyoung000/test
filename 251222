@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import xmltodict
 from tkinter import simpledialog
 
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ====== 1. 설정 및 API 키 ======
