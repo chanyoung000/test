@@ -3,7 +3,7 @@ import re
 import requests
 import folium
 import tkinter as tk
-from tkinter import messagebox, ttk, filedialog, colorchooser
+from tkinter import messagebox, ttk, filedialog, colorchooser, simpledialog
 import json
 import webbrowser
 import os
@@ -38,9 +38,7 @@ except FileNotFoundError:
 
 # 건축물대장 API 키 및 URL
 BUILDING_SERVICE_KEY = "dA0iXwhwNG8gqMCqQkgBeLpp62nNTj2lUTwu4oL0I62spbFID+HCuVbpjvMgjwA8DZqq+nzZEx8WWlwhBTfB8w=="
-# [수정] 일반표제부 URL
 BUILDING_API_URL = "http://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo"
-# [추가] 총괄표제부 URL
 BUILDING_RECAP_API_URL = "http://apis.data.go.kr/1613000/BldRgstHubService/getBrRecapTitleInfo"
 
 # ====== 2. 행정구역 데이터 ======
@@ -114,7 +112,7 @@ def to_pyeong_str(val, decimals=2):
         if not val: return ""
         pyeong = float(val) * 0.3025
         if decimals == 0:
-            return f"{pyeong:,.0f}"  # 천단위 콤마 추가
+            return f"{pyeong:,.0f}"
         return f"{pyeong:.{decimals}f}"
     except:
         return ""
@@ -126,10 +124,16 @@ def save_to_excel():
         messagebox.showerror("오류", "저장할 데이터가 없습니다.")
         return
 
-    save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")],
-                                             title="엑셀 저장 위치 선택")
-    if not save_path:
+    # [수정 3] result 폴더 생성 및 알림창 저장
+    result_dir = os.path.join(base_dir, "result")
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+
+    filename = simpledialog.askstring("엑셀 저장", "저장할 파일명을 입력하세요 (확장자 제외):")
+    if not filename:
         return
+
+    save_path = os.path.join(result_dir, f"{filename}.xlsx")
 
     try:
         temp_list = []
@@ -142,7 +146,6 @@ def save_to_excel():
             if addr and addr not in seen:
                 seen.add(addr)
 
-                # 엑셀용 데이터 가공 (소수점 2자리)
                 arch_area_py = to_pyeong_str(p.get("건축면적", ""), 2)
                 tot_area_py = to_pyeong_str(p.get("연면적", ""), 2)
 
@@ -185,7 +188,7 @@ def save_to_excel():
             ws.append(row)
 
         wb.save(save_path)
-        messagebox.showinfo("완료", f"총 {len(temp_list)}개의 데이터가 저장되었습니다.\n(중복 제거됨)")
+        messagebox.showinfo("완료", f"저장 완료!\n위치: {save_path}\n총 {len(temp_list)}개 데이터")
 
         try:
             os.startfile(save_path)
@@ -340,7 +343,6 @@ def get_geojson_by_pnu(pnu: str, stop_event):
                 if res_recap.status_code == 200:
                     data_recap = xmltodict.parse(res_recap.content)
                     if data_recap.get('response', {}).get('body', {}).get('totalCount') != '0':
-                        # 총괄표제부 존재 -> 바로 리턴
                         item = data_recap['response']['body']['items']['item']
                         if isinstance(item, list): item = item[0]
                         return {
@@ -349,7 +351,7 @@ def get_geojson_by_pnu(pnu: str, stop_event):
                             '연면적': item.get('totArea', ''),
                             '건폐율': item.get('bcRat', ''),
                             '용적률': item.get('vlRat', ''),
-                            '용적률_최고': item.get('vlRat', ''),  # 총괄은 그 자체가 전체이므로 동일값
+                            '용적률_최고': item.get('vlRat', ''),
                             '높이': item.get('heit', ''),
                             '지상층수': item.get('grndFlrCnt', ''),
                             '지하층수': item.get('ugrndFlrCnt', ''),
@@ -357,9 +359,9 @@ def get_geojson_by_pnu(pnu: str, stop_event):
                             '주용도': item.get('mainPurpsCdNm', '')
                         }
             except:
-                pass  # 총괄 조회 실패 시 일반으로 넘어감
+                pass
 
-            # [STEP 2] 일반표제부 조회 및 합산 (기존 로직)
+            # [STEP 2] 일반표제부 조회 및 합산
             params = common_params.copy()
             params['numOfRows'] = '100'
             res = requests.get(BUILDING_API_URL, params=params, timeout=5)
@@ -535,17 +537,24 @@ def open_html_in_server(filepath):
 # ====== 5. 지도 생성 함수 ======
 def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color='#FFA500', fill_color='#ffffff',
                                            fill_opacity=0.2, stroke_weight=2):
-    output_file = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML files", "*.html")],
-                                               title="지도를 저장할 위치를 선택하세요")
-    if not output_file:
+    # [수정 3] result 폴더 생성 및 알림창 저장
+    result_dir = os.path.join(base_dir, "result")
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+
+    filename = simpledialog.askstring("지도 저장", "저장할 지도 파일명을 입력하세요 (확장자 제외):")
+    if not filename:
         return
 
-    # Python 툴팁 데이터 전처리
+    output_file = os.path.join(result_dir, f"{filename}.html")
+
+    # [수정 1] 데이터 빈 값 채우기 (건축물 정보가 없어도 에러 안 나게 처리)
     if geojson['features']:
         for f in geojson['features']:
             p = f.get('properties', {})
 
-            # 연면적
+            if '건물명' not in p: p['건물명'] = "-"
+
             tot_area = p.get('연면적', '')
             if tot_area:
                 try:
@@ -555,14 +564,16 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
             else:
                 p['연면적_fmt'] = "-"
 
-            # 소유구분
             own = p.get('소유구분', '-')
             share = p.get('공유인수', '0')
             p['소유_fmt'] = f"{own}({share})"
 
-            # 건폐율/용적률
             p['건폐율_fmt'] = p.get('건폐율', '-') + "%"
             p['용적률_fmt'] = p.get('용적률', '-') + "%"
+
+            # 기타 필수 필드 안전장치
+            for key in ['addr', '지목', '면적', '공시지가', '용도지역', '개발제한구역']:
+                if key not in p: p[key] = "-"
 
     if not geojson['features']:
         lat, lon = 37.361446, 127.111488
@@ -574,8 +585,24 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
     tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{vworld_key}/Satellite/{{z}}/{{y}}/{{x}}.jpeg"
     folium.TileLayer(tiles=tile_url, attr='VWorld Satellite', name='위성지도', detectRetina=True).add_to(m)
 
-    def style_function(x):
-        return {'fillColor': fill_color, 'color': stroke_color, 'weight': 2, 'fillOpacity': fill_opacity}
+    # [수정 2] 개별 주소 색상 적용 함수
+    def style_function(feature):
+        addr = feature['properties'].get('addr', '')
+        if addr in address_styles:
+            st = address_styles[addr]
+            return {
+                'fillColor': st.get('fill', fill_color),
+                'color': st.get('stroke', stroke_color),
+                'weight': stroke_weight,
+                'fillOpacity': st.get('opacity', fill_opacity)
+            }
+        else:
+            return {
+                'fillColor': fill_color,
+                'color': stroke_color,
+                'weight': stroke_weight,
+                'fillOpacity': fill_opacity
+            }
 
     if geojson['features']:
         # Python 툴팁
@@ -795,15 +822,12 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
                         var bun = pnu.substring(11,15);
                         var ji = pnu.substring(15,19);
                         var platGbCd = (landGb === '1') ? '0' : ((landGb === '2') ? '1' : '0');
-
                         var commonParams = "&serviceKey=" + encodeURIComponent(bldKey) + 
                                          "&sigunguCd=" + sigunguCd + "&bjdongCd=" + bjdongCd + 
                                          "&platGbCd=" + platGbCd + "&bun=" + bun + "&ji=" + ji + 
                                          "&pageNo=1";
-
                         // [STEP 1] 총괄표제부 우선 조회 (JS)
                         var recapFullUrl = recapUrl + "?numOfRows=1" + commonParams;
-
                         requestProxyText(recapFullUrl, function(xmlText) {{
                             var bldInfo = null;
                             try {{
@@ -874,7 +898,7 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
                                             if(bc > maxBc) maxBc = bc;
 
                                             var vl = parseFloat(item.getElementsByTagName("vlRat")[0]?.textContent || 0);
-                                            vlSum += vl; 
+                                            vlSum += vl;
                                             if(vl > maxVl) maxVl = vl;
 
                                             var ht = parseFloat(item.getElementsByTagName("heit")[0]?.textContent || 0);
@@ -984,7 +1008,6 @@ def create_map_with_outer_and_inner_layers(geojson, address_styles, stroke_color
                         "건폐율: " + (p.건폐율 || "-") + "%<br>" + 
                         "용적률: " + (p.용적률 || "-") + "%<br>" + 
                         "개발제한: <span style='" + gbStyle + "'>" + (p.개발제한구역 || "-") + "</span></div>";
-
                     layer.bindTooltip(tooltipContent);
                     layer.on('click', function(e) {{ selectedLayer = e.target; document.getElementById('selectionStatus').innerHTML = "현재: <span style='color:blue;'>" + (p.addr || "추가된 필지") + "</span> 수정 중"; document.getElementById('selectionStatus').style.background = "#e3f2fd"; L.DomEvent.stopPropagation(e); }});
                 }}
@@ -1324,13 +1347,15 @@ def run_gui():
             if mode == "map":
                 features_collection = {"type": "FeatureCollection", "features": excel_features}
                 messagebox.showinfo("알림", f"{msg_prefix}현재까지 수집된 {len(excel_features)}개 필지로 지도를 생성합니다.")
+
+                # [수정 2] 지도 생성 시 기본값 전달 (개별 색상 적용을 위해)
                 root.after(0, lambda: create_map_with_outer_and_inner_layers(
                     features_collection,
                     address_styles,
-                    stroke_color=stroke_color_var.get(),
-                    fill_color=fill_color_var.get(),
-                    fill_opacity=fill_opacity_var.get(),
-                    stroke_weight=stroke_weight_var.get()
+                    stroke_color='#FFA500',  # 기본 선 색상 (오렌지) 고정
+                    fill_color='#ffffff',  # 기본 채움 색상 (흰색) 고정
+                    fill_opacity=0.2,  # 기본 투명도 0.2 고정
+                    stroke_weight=2  # 기본 선 두께 2 고정
                 ))
             else:
                 messagebox.showinfo("알림", f"{msg_prefix}현재까지 수집된 {len(excel_features)}건을 저장합니다.")
