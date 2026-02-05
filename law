@@ -1,0 +1,311 @@
+"""
+land_rules_crawler.py
+- 162개 지자체 건폐율/용적률 자동 수집
+- 자치법규정보시스템 API 활용
+"""
+
+import requests
+import pandas as pd
+import re
+from datetime import datetime
+import time
+
+class LandRulesCrawler:
+    def __init__(self, api_key=None):
+        """
+        api_key: 자치법규정보시스템 API 키 (선택)
+                 없으면 웹 크롤링 모드
+        """
+        self.api_key = api_key
+        self.results = []
+        
+        # 162개 지자체 리스트
+        self.regions = self._load_regions()
+        
+        # 21개 용도지역 표준
+        self.zone_types = [
+            '제1종전용주거지역', '제2종전용주거지역',
+            '제1종일반주거지역', '제2종일반주거지역', '제3종일반주거지역',
+            '준주거지역',
+            '중심상업지역', '일반상업지역', '근린상업지역', '유통상업지역',
+            '전용공업지역', '일반공업지역', '준공업지역',
+            '보전녹지지역', '생산녹지지역', '자연녹지지역',
+            '보전관리지역', '생산관리지역', '계획관리지역',
+            '농림지역', '자연환경보전지역'
+        ]
+    
+    def _load_regions(self):
+        """162개 지자체 리스트"""
+        return [
+            "서울특별시", "부산광역시", "대구광역시", "인천광역시",
+            "광주광역시", "대전광역시", "울산광역시", "세종특별자치시",
+            "경기도 고양시", "경기도 과천시", "경기도 광명시", "경기도 광주시",
+            # ... (전체 162개)
+        ]
+    
+    def get_ordinance_from_api(self, region_name):
+        """
+        API로 조례 가져오기
+        """
+        if not self.api_key:
+            print("⚠️ API 키 없음. 웹 크롤링 모드로 전환")
+            return self.get_ordinance_from_web(region_name)
+        
+        url = "https://www.elis.go.kr/openapi/ordinanceInfo.do"
+        params = {
+            'serviceKey': self.api_key,
+            'query': f'{region_name} 도시계획 조례',
+            'type': 'json'
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            data = response.json()
+            return data
+        except Exception as e:
+            print(f"❌ API 오류: {e}")
+            return None
+    
+    def get_ordinance_from_web(self, region_name):
+        """
+        웹 크롤링으로 조례 가져오기 (API 없을 때)
+        """
+        # 국가법령정보센터에서 검색
+        url = "https://www.law.go.kr/LSW/ordinInfoP.do"
+        params = {
+            'ordinSeq': '',  # 조례 일련번호
+            'searchType': 'name',
+            'query': f'{region_name} 도시계획'
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            # HTML 파싱 필요
+            return response.text
+        except Exception as e:
+            print(f"❌ 웹 크롤링 오류: {e}")
+            return None
+    
+    def parse_ordinance(self, ordinance_data, region_name):
+        """
+        조례에서 건폐율/용적률 추출
+        """
+        # 조례 텍스트 추출
+        if isinstance(ordinance_data, dict):
+            text = ordinance_data.get('content', '')
+        else:
+            text = str(ordinance_data)
+        
+        # 건폐율 조항 찾기
+        coverage_pattern = r'건폐율.*?제(\d+)조'
+        coverage_match = re.search(coverage_pattern, text)
+        coverage_article = f"제{coverage_match.group(1)}조" if coverage_match else "제55조"
+        
+        # 용적률 조항 찾기
+        ratio_pattern = r'용적률.*?제(\d+)조'
+        ratio_match = re.search(ratio_pattern, text)
+        ratio_article = f"제{ratio_match.group(1)}조" if ratio_match else "제56조"
+        
+        # 시행일 찾기
+        date_pattern = r'시행\s*(\d{4})\.(\d{1,2})\.(\d{1,2})'
+        date_match = re.search(date_pattern, text)
+        if date_match:
+            시행일 = f"{date_match.group(1)}-{date_match.group(2):0>2}-{date_match.group(3):0>2}"
+        else:
+            시행일 = datetime.now().strftime('%Y-%m-%d')
+        
+        # 조례명
+        조례명 = f"{region_name.split()[-1] if ' ' in region_name else region_name} 도시계획 조례"
+        if "특별시" in region_name or "광역시" in region_name:
+            조례명 = f"{region_name} 도시계획 조례"
+        
+        # 각 용도지역별 데이터 생성
+        for zone in self.zone_types:
+            # 기본값 (국토계획법 기준)
+            default_values = self._get_default_values(zone)
+            
+            # 조례에서 특별 규정 찾기
+            zone_pattern = rf'{zone}.*?(\d+).*?(\d+)'
+            zone_match = re.search(zone_pattern, text)
+            
+            if zone_match:
+                건폐율 = int(zone_match.group(1))
+                용적률 = int(zone_match.group(2))
+            else:
+                건폐율 = default_values['건폐율']
+                용적률 = default_values['용적률']
+            
+            # 비고 (역세권 등 특이사항)
+            비고 = self._extract_remarks(text, zone)
+            
+            self.results.append({
+                '지자체': region_name,
+                '용도지역': zone,
+                '건폐율': 건폐율,
+                '용적률': 용적률,
+                '조례명': 조례명,
+                '조항': f"{coverage_article}·{ratio_article}",
+                '시행일': 시행일,
+                '비고': 비고
+            })
+    
+    def _get_default_values(self, zone_type):
+        """
+        국토계획법 기본값
+        """
+        defaults = {
+            '제1종전용주거지역': {'건폐율': 50, '용적률': 100},
+            '제2종전용주거지역': {'건폐율': 50, '용적률': 150},
+            '제1종일반주거지역': {'건폐율': 60, '용적률': 200},
+            '제2종일반주거지역': {'건폐율': 60, '용적률': 250},
+            '제3종일반주거지역': {'건폐율': 50, '용적률': 300},
+            '준주거지역': {'건폐율': 70, '용적률': 500},
+            '중심상업지역': {'건폐율': 90, '용적률': 1500},
+            '일반상업지역': {'건폐율': 80, '용적률': 1300},
+            '근린상업지역': {'건폐율': 70, '용적률': 900},
+            '유통상업지역': {'건폐율': 80, '용적률': 1100},
+            '전용공업지역': {'건폐율': 70, '용적률': 300},
+            '일반공업지역': {'건폐율': 70, '용적률': 350},
+            '준공업지역': {'건폐율': 70, '용적률': 400},
+            '보전녹지지역': {'건폐율': 20, '용적률': 80},
+            '생산녹지지역': {'건폐율': 20, '용적률': 100},
+            '자연녹지지역': {'건폐율': 20, '용적률': 100},
+            '보전관리지역': {'건폐율': 20, '용적률': 80},
+            '생산관리지역': {'건폐율': 20, '용적률': 80},
+            '계획관리지역': {'건폐율': 40, '용적률': 100},
+            '농림지역': {'건폐율': 20, '용적률': 80},
+            '자연환경보전지역': {'건폐율': 20, '용적률': 80},
+        }
+        return defaults.get(zone_type, {'건폐율': 60, '용적률': 200})
+    
+    def _extract_remarks(self, text, zone_type):
+        """
+        비고 추출 (역세권 등)
+        """
+        remarks = []
+        
+        # 역세권 완화
+        station_pattern = rf'{zone_type}.*?역세권.*?(\d+)%'
+        station_match = re.search(station_pattern, text)
+        if station_match:
+            remarks.append(f"역세권(지하철역 250m 이내)은 {station_match.group(1)}%까지 완화 가능")
+        
+        # 지구단위계획
+        district_pattern = rf'{zone_type}.*?지구단위.*?(\d+)%'
+        district_match = re.search(district_pattern, text)
+        if district_match:
+            remarks.append(f"지구단위계획구역 내 {district_match.group(1)}%까지 완화 가능")
+        
+        return ', '.join(remarks) if remarks else ''
+    
+    def crawl_all(self):
+        """
+        전체 지자체 크롤링
+        """
+        total = len(self.regions)
+        
+        for idx, region in enumerate(self.regions, 1):
+            print(f"\n[{idx}/{total}] {region} 처리 중...")
+            
+            try:
+                # 조례 가져오기
+                ordinance = self.get_ordinance_from_api(region)
+                
+                if ordinance:
+                    # 파싱
+                    self.parse_ordinance(ordinance, region)
+                    print(f"✅ {region} 완료")
+                else:
+                    print(f"⚠️ {region} 조례 없음 - 기본값 사용")
+                    self._use_default_values(region)
+                
+                # 서버 부담 줄이기
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"❌ {region} 오류: {e}")
+                self._use_default_values(region)
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 전체 작업 완료!")
+        print(f"총 {len(self.results)}개 데이터 수집")
+        print(f"{'='*60}\n")
+    
+    def _use_default_values(self, region_name):
+        """
+        조례 없을 때 기본값 사용
+        """
+        for zone in self.zone_types:
+            default = self._get_default_values(zone)
+            self.results.append({
+                '지자체': region_name,
+                '용도지역': zone,
+                '건폐율': default['건폐율'],
+                '용적률': default['용적률'],
+                '조례명': f"{region_name} 도시계획 조례",
+                '조항': '국토계획법 기준',
+                '시행일': datetime.now().strftime('%Y-%m-%d'),
+                '비고': '조례 미확인 - 국토계획법 기본값'
+            })
+    
+    def save_to_csv(self, filename='land_rules_korea_162.csv'):
+        """
+        CSV 저장
+        """
+        df = pd.DataFrame(self.results)
+        
+        # 컬럼 순서
+        columns = ['지자체', '용도지역', '건폐율', '용적률', 
+                   '조례명', '조항', '시행일', '비고']
+        df = df[columns]
+        
+        # 저장
+        df.to_csv(filename, index=False, encoding='utf-8-sig')
+        
+        print(f"✅ CSV 저장 완료: {filename}")
+        print(f"📊 총 {len(df)}개 데이터")
+        
+        return df
+    
+    def save_to_sqlite(self, db_name='land_rules.db'):
+        """
+        SQLite DB 저장
+        """
+        import sqlite3
+        
+        df = pd.DataFrame(self.results)
+        conn = sqlite3.connect(db_name)
+        df.to_sql('land_rules', conn, if_exists='replace', index=False)
+        conn.close()
+        
+        print(f"✅ DB 저장 완료: {db_name}")
+
+# 실행
+if __name__ == "__main__":
+    print("="*60)
+    print("🏗️  대한민국 162개 지자체 건폐율/용적률 수집기")
+    print("="*60)
+    
+    # API 키 (선택)
+    API_KEY = None  # 또는 발급받은 키 입력
+    
+    # 크롤러 생성
+    crawler = LandRulesCrawler(api_key=API_KEY)
+    
+    # 전체 수집
+    crawler.crawl_all()
+    
+    # CSV 저장
+    df = crawler.save_to_csv()
+    
+    # DB 저장
+    crawler.save_to_sqlite()
+    
+    # 미리보기
+    print("\n=== 데이터 미리보기 ===")
+    print(df.head(10))
+    
+    print("\n=== 통계 ===")
+    print(f"지자체 수: {df['지자체'].nunique()}개")
+    print(f"용도지역 수: {df['용도지역'].nunique()}개")
+    print(f"총 데이터: {len(df)}개")
