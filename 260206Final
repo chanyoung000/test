@@ -1,0 +1,1311 @@
+import pandas as pd
+import re
+import requests
+import folium
+import tkinter as tk
+from tkinter import messagebox, ttk, filedialog, colorchooser, simpledialog
+import json
+import webbrowser
+import os
+import sys
+import geopandas as gpd
+from shapely.geometry import shape
+import openpyxl
+import urllib3
+import concurrent.futures
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+import xmltodict
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# [기능 1] 디버깅 로그 출력 함수
+def debug_log(msg):
+    print(f"[DEBUG] {msg}")
+
+
+# ====== 1. 설정 및 API 키 ======
+if getattr(sys, 'frozen', False):
+    base_dir = os.path.dirname(sys.executable)
+else:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+# VWorld API 키
+key_path = os.path.join(base_dir, 'vworld_key.txt')
+try:
+    with open(key_path, 'r') as f:
+        vworld_key = f.read().strip()
+    debug_log(f"VWorld 키 로드 성공: {vworld_key[:5]}...")
+except FileNotFoundError:
+    vworld_key = "API_KEY_NOT_FOUND"
+    debug_log("VWorld 키 파일 없음")
+
+# 공공데이터포털 API 키 (건축물대장)
+BUILDING_SERVICE_KEY = "dA0iXwhwNG8gqMCqQkgBeLpp62nNTj2lUTwu4oL0I62spbFID+HCuVbpjvMgjwA8DZqq+nzZEx8WWlwhBTfB8w=="
+
+BUILDING_API_URL = "http://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo"
+BUILDING_RECAP_API_URL = "http://apis.data.go.kr/1613000/BldRgstHubService/getBrRecapTitleInfo"
+
+# ====== 1-2. 커스텀 DB 로드 (DB.csv) ======
+CUSTOM_LIMIT_DB = {}
+
+
+def load_custom_db():
+    global CUSTOM_LIMIT_DB
+    db_path = os.path.join(base_dir, "DB.csv")
+
+    if not os.path.exists(db_path):
+        debug_log("⚠️ DB.csv 파일이 없습니다. 한계값 기능이 비활성화됩니다.")
+        return
+
+    try:
+        try:
+            df = pd.read_csv(db_path, encoding='utf-8-sig')
+        except UnicodeDecodeError:
+            df = pd.read_csv(db_path, encoding='cp949')
+
+        df.columns = [c.strip() for c in df.columns]
+
+        required = ['시군구코드', '용도지역', '건폐율', '용적률']
+        for r in required:
+            if r not in df.columns:
+                debug_log(f"⚠️ DB.csv에 '{r}' 컬럼이 없습니다.")
+                return
+
+        count = 0
+        for _, row in df.iterrows():
+            code = str(row['시군구코드']).strip().split('.')[0]
+            zone = str(row['용도지역']).strip()
+            bc = str(row['건폐율']).strip()
+            vl = str(row['용적률']).strip()
+
+            if code not in CUSTOM_LIMIT_DB:
+                CUSTOM_LIMIT_DB[code] = {}
+
+            CUSTOM_LIMIT_DB[code][zone] = {'bc': bc, 'vl': vl}
+            count += 1
+
+        debug_log(f"✅ DB.csv 로드 완료 ({len(CUSTOM_LIMIT_DB)}개 지자체, {count}개 데이터)")
+
+    except Exception as e:
+        debug_log(f"❌ DB.csv 로드 중 오류: {e}")
+
+
+load_custom_db()
+
+# ====== 2. 행정구역 데이터 ======
+sigungu_dict = {
+    "서울특별시": ["종로구", "중구", "용산구", "성동구", "광진구", "동대문구", "중랑구", "성북구", "강북구", "도봉구", "노원구", "은평구", "서대문구", "마포구", "양천구",
+              "강서구", "구로구", "금천구", "영등포구", "동작구", "관악구", "서초구", "강남구", "송파구", "강동구"],
+    "경기도": ["성남시 수정구", "성남시 중원구", "성남시 분당구", "의정부시", "안양시 만안구", "하남시", "용인시 처인구", "용인시 기흥구", "용인시 수지구", "파주시",
+            "수원시 장안구", "수원시 권선구", "수원시 팔달구", "수원시 영통구", "안양시 동안구", "부천시", "광명시", "평택시", "동두천시", "안산시 상록구", "안산시 단원구",
+            "고양시 덕양구", "고양시 일산동구", "고양시 일산서구", "과천시", "구리시", "남양주시", "오산시", "시흥시", "군포시", "의왕시", "이천시", "안성시", "김포시",
+            "화성시", "광주시", "여주시", "양평군", "연천군", "포천시", "가평군"],
+    "부산광역시": ["중구", "서구", "동구", "영도구", "부산진구", "동래구", "남구", "북구", "해운대구", "사하구", "금정구", "강서구", "연제구", "수영구", "사상구",
+              "기장군"],
+    "대구광역시": ["중구", "동구", "서구", "남구", "북구", "수성구", "달서구", "달성군", "군위군"],
+    "인천광역시": ["중구", "동구", "미추홀구", "연수구", "남동구", "부평구", "계양구", "서구", "강화군", "옹진군"],
+    "광주광역시": ["동구", "서구", "남구", "북구", "광산구"],
+    "대전광역시": ["동구", "중구", "서구", "유성구", "대덕구"],
+    "울산광역시": ["중구", "남구", "동구", "북구", "울주군"],
+    "세종특별자치시": ["세종시"],
+    "강원특별자치도": ["춘천시", "원주시", "강릉시", "동해시", "태백시", "속초시", "삼척시", "홍천군", "횡성군", "영월군", "평창군", "정선군", "철원군", "화천군", "양구군",
+                "인제군", "고성군", "양양군"],
+    "충청북도": ["청주시 상당구", "청주시 서원구", "청주시 흥덕구", "청주시 청원구", "충주시", "제천시", "보은군", "옥천군", "영동군", "증평군", "진천군", "괴산군", "음성군",
+             "단양군"],
+    "충청남도": ["천안시 동남구", "천안시 서북구", "공주시", "보령시", "아산시", "서산시", "논산시", "계룡시", "당진시", "금산군", "부여군", "서천군", "청양군", "홍성군",
+             "예산군", "태안군"],
+    "전북특별자치도": ["전주시 완산구", "전주시 덕진구", "군산시", "익산시", "정읍시", "남원시", "김제시", "완주군", "진안군", "무주군", "장수군", "임실군", "순창군",
+                "고창군", "부안군"],
+    "전라남도": ["목포시", "여수시", "순천시", "나주시", "광양시", "담양군", "곡성군", "구례군", "고흥군", "보성군", "화순군", "장흥군", "강진군", "해남군", "영암군",
+             "무안군", "함평군", "영광군", "장성군", "완도군", "진도군", "신안군"],
+    "경상북도": ["포항시 남구", "포항시 북구", "경주시", "김천시", "안동시", "구미시", "영주시", "영천시", "상주시", "문경시", "경산시", "군위군", "의성군", "청송군",
+             "영양군", "영덕군", "청도군", "고령군", "성주군", "칠곡군", "예천군", "봉화군", "울진군", "울릉군"],
+    "경상남도": ["창원시 의창구", "창원시 성산구", "창원시 마산합포구", "창원시 마산회원구", "창원시 진해구", "진주시", "통영시", "사천시", "김해시", "밀양시", "거제시", "양산시",
+             "의령군", "함안군", "창녕군", "고성군", "남해군", "하동군", "산청군", "함양군", "거창군", "합천군"],
+    "제주특별자치도": ["제주시", "서귀포시"]
+}
+sido_list = list(sigungu_dict.keys())
+
+# ====== 3. 법정동코드 불러오기 ======
+csv_path = os.path.join(base_dir, '국토교통부_법정동코드_20240805.csv')
+dong_lookup = {}
+
+if os.path.exists(csv_path):
+    try:
+        dong_df = pd.read_csv(csv_path, encoding="cp949")
+        dong_df = dong_df[dong_df["폐지여부"] == "존재"]
+        for _, row in dong_df.iterrows():
+            name = row['법정동명']
+            code = str(row['법정동코드'])
+            parts = name.split()
+            if not parts: continue
+            dong_name = parts[-1]
+            sido = parts[0]
+            sigungu = " ".join(parts[1:-1])
+            if dong_name not in dong_lookup:
+                dong_lookup[dong_name] = []
+            dong_lookup[dong_name].append({'full_addr': name, 'sido': sido, 'sigungu': sigungu, 'code': code})
+        debug_log(f"법정동 CSV 로드 완료 ({len(dong_lookup)}개 동)")
+    except Exception as e:
+        debug_log(f"법정동 로드 실패: {e}")
+        dong_lookup = {}
+else:
+    debug_log("법정동 CSV 파일이 없습니다.")
+    dong_lookup = {}
+
+excel_features = []
+data_lock = threading.Lock()
+
+
+# ====== 4. 핵심 기능 함수들 ======
+
+def to_pyeong_str(val, decimals=2):
+    try:
+        if not val: return ""
+        pyeong = float(val) * 0.3025
+        if decimals == 0:
+            return f"{pyeong:,.0f}"
+        return f"{pyeong:.{decimals}f}"
+    except:
+        return ""
+
+
+def save_to_excel():
+    global excel_features
+    if not excel_features:
+        messagebox.showerror("오류", "저장할 데이터가 없습니다.")
+        return
+
+    result_dir = os.path.join(base_dir, "result")
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+
+    filename = simpledialog.askstring("엑셀 저장", "저장할 파일명을 입력하세요 (확장자 제외):")
+    if not filename:
+        return
+
+    save_path = os.path.join(result_dir, f"{filename}.xlsx")
+
+    try:
+        temp_list = []
+        seen = set()
+
+        for f in excel_features:
+            p = f.get("properties", {})
+            addr = p.get("addr", "")
+
+            if addr:
+                if addr not in seen:
+                    seen.add(addr)
+
+                arch_area_py = to_pyeong_str(p.get("건축면적", ""), 2)
+                tot_area_py = to_pyeong_str(p.get("연면적", ""), 2)
+
+                district_plan = p.get("지구단위계획구역", "")
+                remark = "지구단위계획구역상 건폐율/용적률 확인 필수!" if district_plan else ""
+
+                temp_list.append([
+                    p.get("addr", ""),
+                    p.get("지목", ""),
+                    p.get("면적", ""),
+                    p.get("공시지가", ""),
+                    p.get("소유구분", ""),
+                    p.get("공유인수", ""),
+                    p.get("용도지역1", ""),
+                    p.get("용도지역2", ""),
+                    p.get("용도지역3", ""),
+                    p.get("한계건폐율", ""),
+                    p.get("건폐율", ""),
+                    p.get("한계용적률", ""),
+                    p.get("용적률", ""),
+                    district_plan,
+                    p.get("국가산업단지", ""),
+                    p.get("개발제한구역", ""),
+                    p.get("건물명", ""),
+                    p.get("주용도", ""),
+                    arch_area_py,
+                    tot_area_py,
+                    p.get("높이", ""),
+                    p.get("지상층수", ""),
+                    p.get("지하층수", ""),
+                    p.get("사용승인일", ""),
+                    p.get("기타용도지역", ""),
+                    remark
+                ])
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "통합정보"
+
+        headers = [
+            "주소/PNU", "지목", "면적(평)", "공시지가(평당)", "소유구분", "공유인수",
+            "용도지역1", "용도지역2", "용도지역3",
+            "한계건폐율", "현재건폐율(%)", "한계용적률", "현재용적률(%)",
+            "지구단위계획", "국가산업단지", "개발제한구역",
+            "건물명", "주용도", "건축면적(평)", "연면적(평)", "높이(m)", "지상층", "지하층", "사용승인일",
+            "기타 규제사항", "비고(Check)"
+        ]
+        ws.append(headers)
+
+        for row in temp_list:
+            ws.append(row)
+
+        wb.save(save_path)
+        messagebox.showinfo("완료", f"저장 완료!\n위치: {save_path}\n총 {len(temp_list)}개 데이터")
+
+        try:
+            os.startfile(save_path)
+        except Exception:
+            pass
+
+    except Exception as e:
+        messagebox.showerror("저장 오류", str(e))
+
+
+def address_to_pnu(address: str) -> str:
+    address = address.strip()
+    if re.match(r'^\d{19}$', address): return address
+
+    is_san = bool(re.search(r'\b산\s*\d+', address))
+
+    match = re.search(r'(.+?(동|읍|면|리|로\s?\d+가|가\s?\d+가?))\s*(산)?\s*(\d+)-?(\d*)', address)
+    if not match:
+        debug_log(f"주소 형식 불일치: {address}")
+        raise ValueError("주소 형식을 인식할 수 없습니다.")
+
+    full_loc_part = match.group(1).strip()
+    dong_name = full_loc_part.split()[-1].strip()
+
+    if dong_name not in dong_lookup:
+        split_parts = full_loc_part.split()
+        fallback_dong = split_parts[-1]
+        if fallback_dong in dong_lookup:
+            dong_name = fallback_dong
+        else:
+            debug_log(f"법정동 매칭 실패: {dong_name} (입력주소: {address})")
+            raise ValueError(f"법정동 '{dong_name}'을 찾을 수 없습니다.")
+
+    candidates = dong_lookup[dong_name]
+    selected_code = None
+
+    if len(candidates) == 1:
+        selected_code = candidates[0]['code']
+    else:
+        best_match = None
+        max_score = 0
+        for cand in candidates:
+            score = 0
+            if cand['sido'] in full_loc_part: score += 2
+            if cand['sigungu'] in full_loc_part: score += 3
+            for part in cand['sigungu'].split():
+                if part in full_loc_part: score += 1
+
+            if score > max_score:
+                max_score = score
+                best_match = cand
+
+        if best_match and max_score > 0:
+            selected_code = best_match['code']
+        else:
+            debug_log(f"법정동 중복 매칭 실패: {dong_name}")
+            raise ValueError(f"'{dong_name}'은 여러 도시에 존재하며, 시군구를 특정할 수 없습니다.")
+
+    main_number = match.group(4).zfill(4)
+    sub_number = match.group(5).zfill(4) if match.group(5) else '0000'
+    san_code = '2' if is_san else '1'
+
+    pnu = f"{selected_code}{san_code}{main_number}{sub_number}"
+    debug_log(f"PNU 변환 성공: {address} -> {pnu}")
+    return pnu
+
+
+# ====== [데이터 조회 함수] ======
+def get_geojson_by_pnu(pnu: str, stop_event):
+    # 1. 개별공시지가
+    def get_official_price(pnu):
+        if stop_event.is_set(): return ""
+        try:
+            url = "https://api.vworld.kr/ned/data/getIndvdLandPriceAttr"
+            params = {"key": vworld_key, "pnu": pnu, "format": "json", "numOfRows": "10", "pageNo": "1",
+                      "domain": "http://localhost"}
+            res = requests.get(url, params=params, verify=False, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                items = data.get("indvdLandPrices", {}).get("field", [])
+                if items:
+                    items.sort(key=lambda x: int(x.get('stdrYear', 0)), reverse=True)
+                    price = items[0].get('pblntfPclnd', '0')
+                    try:
+                        return f"{float(price) / 0.3025:,.0f}"
+                    except:
+                        return ""
+        except:
+            pass
+        return ""
+
+    # 2. 토지대장
+    def get_ladfrl_details(pnu):
+        if stop_event.is_set(): return {}
+        try:
+            url = "https://api.vworld.kr/ned/data/ladfrlList"
+            params = {"key": vworld_key, "domain": "land", "pnu": pnu, "format": "json", "numOfRows": "1",
+                      "pageNo": "1"}
+            res = requests.get(url, params=params, verify=False, timeout=5)
+            if res.status_code == 200:
+                item = res.json().get("ladfrlVOList", {}).get("ladfrlVOList", [{}])[0]
+                area = item.get("lndpclAr", "")
+                try:
+                    area_fmt = f"{float(area) * 0.3025:,.2f}"
+                except:
+                    area_fmt = ""
+                return {"지목": item.get("lndcgrCodeNm", ""), "면적": area_fmt, "소유구분": item.get("posesnSeCodeNm", ""),
+                        "공유인수": item.get("cnrsPsnCo", "")}
+        except:
+            pass
+        return {"지목": "", "면적": "", "소유구분": "", "공유인수": ""}
+
+    # 3. 용도지역 및 기타 구역 (VWorld 파싱)
+    def get_land_use_detailed(pnu):
+        if stop_event.is_set(): return {}
+
+        base_data = {
+            "용도지역1": "", "용도지역2": "", "용도지역3": "",
+            "지구단위계획구역": "", "국가산업단지": "", "개발제한구역": "",
+            "기타용도지역": "", "용도지역_코드명": ""
+        }
+
+        try:
+            url = "https://api.vworld.kr/ned/wfs/getLandUseWFS"
+            params = {"key": vworld_key, "domain": "landuse", "typename": "dt_d154", "pnu": pnu, "maxFeatures": "10",
+                      "resultType": "results", "srsName": "EPSG:4326", "output": "application/json"}
+            res = requests.get(url, params=params, verify=False, timeout=5)
+            if res.status_code == 200:
+                full_text = ""
+                features = res.json().get("features", [])
+                if features: full_text = features[0].get("properties", {}).get("prpos_area_dstrc_nm_list", "")
+
+                items = [x.strip() for x in full_text.split(',')]
+                core_list = []
+                other_list = []
+                CORE_KEYWORDS = ["주거지역", "상업지역", "공업지역", "녹지지역", "관리지역", "농림지역", "자연환경보전지역"]
+
+                for item in items:
+                    if not item: continue
+                    is_core = False
+                    for kw in CORE_KEYWORDS:
+                        if kw in item:
+                            core_list.append(item)
+                            is_core = True
+                            break
+
+                    if "지구단위" in item:
+                        base_data["지구단위계획구역"] = item
+                    elif "국가산업단지" in item:
+                        base_data["국가산업단지"] = item
+                    elif "개발제한구역" in item:
+                        base_data["개발제한구역"] = item
+                    elif not is_core:
+                        other_list.append(item)
+
+                for i in range(min(len(core_list), 3)):
+                    base_data[f"용도지역{i + 1}"] = core_list[i]
+
+                base_data["기타용도지역"] = ",".join(other_list)
+                if core_list: base_data["용도지역_코드명"] = core_list[0]
+
+        except Exception as e:
+            pass
+
+        return base_data
+
+    # 4. DB 기반 한계값 조회
+    def get_db_info(pnu, zone_name):
+        if not zone_name: return {"bc": "-", "vl": "-"}
+
+        sigungu_code = pnu[:5]
+        search_codes = [sigungu_code]
+
+        if sigungu_code[4] != '0':
+            parent_city_code = sigungu_code[:4] + '0'
+            search_codes.append(parent_city_code)
+
+        search_codes.extend([pnu[:4], pnu[:3], pnu[:2]])
+
+        for code in search_codes:
+            if code in CUSTOM_LIMIT_DB:
+                zone_data = CUSTOM_LIMIT_DB[code]
+                if zone_name in zone_data:
+                    res = zone_data[zone_name]
+                    debug_log(f"✅ DB 매칭 성공! Code:{code}")
+                    return res
+
+                clean_zone_name = zone_name.replace(" ", "")
+                for db_zone, vals in zone_data.items():
+                    if db_zone.replace(" ", "") == clean_zone_name:
+                        return vals
+
+        debug_log(f"❌ DB 매칭 실패. (PNU:{pnu})")
+        return {"bc": "-", "vl": "-"}
+
+    # 5. 건축물대장
+    def get_building_info(pnu):
+        if stop_event.is_set(): return {}
+        try:
+            pnu = str(pnu).strip()
+            if len(pnu) != 19: return {}
+            sigungu_cd = pnu[0:5];
+            bjdong_cd = pnu[5:10];
+            land_gb = pnu[10];
+            bun = pnu[11:15];
+            ji = pnu[15:19]
+            plat_gb_cd = '0' if land_gb == '1' else ('1' if land_gb == '2' else '0')
+            common_params = {'serviceKey': BUILDING_SERVICE_KEY, 'sigunguCd': sigungu_cd, 'bjdongCd': bjdong_cd,
+                             'platGbCd': plat_gb_cd, 'bun': bun, 'ji': ji, 'pageNo': '1'}
+
+            try:
+                recap_params = common_params.copy();
+                recap_params['numOfRows'] = '1'
+                res_recap = requests.get(BUILDING_RECAP_API_URL, params=recap_params, timeout=5)
+                if res_recap.status_code == 200:
+                    data_recap = xmltodict.parse(res_recap.content)
+                    if data_recap.get('response', {}).get('body', {}).get('totalCount') != '0':
+                        item = data_recap['response']['body']['items']['item']
+                        if isinstance(item, list): item = item[0]
+                        return {'건물명': item.get('bldNm', ''), '건축면적': item.get('archArea', ''),
+                                '연면적': item.get('totArea', ''), '건폐율': item.get('bcRat', ''),
+                                '용적률': item.get('vlRat', ''), '용적률_최고': item.get('vlRat', ''),
+                                '높이': item.get('heit', ''), '지상층수': item.get('grndFlrCnt', ''),
+                                '지하층수': item.get('ugrndFlrCnt', ''), '사용승인일': item.get('useAprDay', ''),
+                                '주용도': item.get('mainPurpsCdNm', '')}
+            except:
+                pass
+
+            params = common_params.copy();
+            params['numOfRows'] = '100'
+            res = requests.get(BUILDING_API_URL, params=params, timeout=5)
+            if res.status_code == 200:
+                data = xmltodict.parse(res.content)
+                if data.get('response', {}).get('body', {}).get('totalCount') == '0': return {}
+                items = data['response']['body']['items']['item']
+                if not isinstance(items, list): items = [items]
+                bld_names = set();
+                purps_names = set()
+                arch_area_sum = 0.0;
+                tot_area_sum = 0.0;
+                max_bc_rat = 0.0;
+                tot_vl_rat_sum = 0.0;
+                max_vl_rat = 0.0;
+                max_heit = 0.0;
+                max_grnd = 0;
+                max_ugrnd = 0;
+                max_use_apr = ""
+                for item in items:
+                    nm = item.get('bldNm');
+                    if nm: bld_names.add(nm)
+                    purp = item.get('mainPurpsCdNm');
+                    if purp: purps_names.add(purp)
+                    try:
+                        arch_area_sum += float(item.get('archArea') or 0)
+                    except:
+                        pass
+                    try:
+                        tot_area_sum += float(item.get('totArea') or 0)
+                    except:
+                        pass
+                    try:
+                        max_bc_rat = max(max_bc_rat, float(item.get('bcRat') or 0))
+                    except:
+                        pass
+                    try:
+                        vl = float(item.get('vlRat') or 0);
+                        tot_vl_rat_sum += vl;
+                        max_vl_rat = max(max_vl_rat, vl)
+                    except:
+                        pass
+                    try:
+                        max_heit = max(max_heit, float(item.get('heit') or 0))
+                    except:
+                        pass
+                    try:
+                        max_grnd = max(max_grnd, int(item.get('grndFlrCnt') or 0))
+                    except:
+                        pass
+                    try:
+                        max_ugrnd = max(max_ugrnd, int(item.get('ugrndFlrCnt') or 0))
+                    except:
+                        pass
+                    apr = item.get('useAprDay') or ""
+                    if apr > max_use_apr: max_use_apr = apr
+                return {'건물명': ",".join(sorted(list(bld_names))), '건축면적': str(arch_area_sum),
+                        '연면적': str(tot_area_sum),
+                        '건폐율': str(max_bc_rat) if max_bc_rat > 0 else '',
+                        '용적률': str(tot_vl_rat_sum) if tot_vl_rat_sum > 0 else '',
+                        '용적률_최고': str(max_vl_rat) if max_vl_rat > 0 else '', '높이': str(max_heit),
+                        '지상층수': str(max_grnd),
+                        '지하층수': str(max_ugrnd), '사용승인일': max_use_apr, '주용도': ",".join(sorted(list(purps_names)))}
+        except:
+            pass
+        return {}
+
+    # 5. GeoJSON 조회 (메인 실행부)
+    if stop_event.is_set(): raise InterruptedError("Stopped")
+    url = "http://api.vworld.kr/req/data"
+    params = {"service": "data", "request": "GetFeature", "key": vworld_key, "data": "LP_PA_CBND_BUBUN",
+              "attrFilter": f"pnu:=:{pnu}", "format": "json", "crs": "EPSG:4326"}
+
+    for _ in range(3):
+        if stop_event.is_set(): raise InterruptedError("Stopped")
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                features = (data.get("features") or data.get("result", {}).get("featureCollection", {}).get(
+                    "features") or data.get("response", {}).get("result", {}).get("featureCollection", {}).get(
+                    "features"))
+                if features:
+                    debug_log(f"GeoJSON 수신 성공: {pnu}")
+                    price_val = get_official_price(pnu)
+
+                    luris_info = get_land_use_detailed(pnu)
+                    lad_info = get_ladfrl_details(pnu)
+                    bld_info = get_building_info(pnu)
+
+                    db_info = get_db_info(pnu, luris_info.get("용도지역_코드명", ""))
+
+                    for f in features:
+                        if "properties" not in f: f["properties"] = {}
+                        f["properties"]["공시지가"] = price_val
+                        f["properties"].update(luris_info)
+                        f["properties"].update(lad_info)
+                        f["properties"].update(bld_info)
+                        f["properties"]["한계건폐율"] = db_info.get('bc')
+                        f["properties"]["한계용적률"] = db_info.get('vl')
+                    return {"type": "FeatureCollection", "features": features}
+                else:
+                    debug_log(f"GeoJSON 데이터 없음: {pnu}")
+            else:
+                debug_log(f"API 요청 실패: {res.status_code}")
+        except Exception as e:
+            debug_log(f"API 요청 예외: {e}")
+            time.sleep(0.5)
+
+    raise ValueError("API 데이터 없음")
+
+
+def get_center_from_geojson(geojson):
+    coords = geojson['features'][0]['geometry']['coordinates'][0][0]
+    lons, lats = zip(*coords)
+    return sum(lats) / len(lats), sum(lons) / len(lons)
+
+
+# ====== 5. 지도 생성 함수 ======
+def create_map_with_outer_and_inner_layers(geojson, address_list, address_styles, stroke_color='#FFA500',
+                                           fill_color='#ffffff',
+                                           fill_opacity=0.2, stroke_weight=2):
+    result_dir = os.path.join(base_dir, "result")
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+
+    filename = simpledialog.askstring("지도 저장", "저장할 지도 파일명을 입력하세요 (확장자 제외):")
+    if not filename:
+        return
+
+    output_file = os.path.join(result_dir, f"{filename}.html")
+
+    if geojson['features']:
+        for f in geojson['features']:
+            p = f.get('properties', {})
+            if '건물명' not in p: p['건물명'] = "-"
+
+            tot_area = p.get('연면적', '')
+            if tot_area:
+                try:
+                    p['연면적_fmt'] = f"{float(tot_area) * 0.3025:,.0f}평"
+                except:
+                    p['연면적_fmt'] = "-"
+            else:
+                p['연면적_fmt'] = "-"
+
+            own = p.get('소유구분', '-')
+            share = p.get('공유인수', '0')
+            p['소유_fmt'] = f"{own}({share})"
+
+            curr_bc = p.get('건폐율', '') if p.get('건폐율', '') else '-'
+            limit_bc = p.get('한계건폐율', '') if p.get('한계건폐율', '') else '-'
+            p['tooltip_bc'] = f"{curr_bc} / {limit_bc}"
+
+            curr_vl = p.get('용적률', '') if p.get('용적률', '') else '-'
+            limit_vl = p.get('한계용적률', '') if p.get('한계용적률', '') else '-'
+            p['tooltip_vl'] = f"{curr_vl} / {limit_vl}"
+
+            district = p.get('지구단위계획구역', '')
+            if district:
+                p['district_fmt'] = district
+                p['remark_fmt'] = "⚠️지구단위계획구역상 건폐율/용적률 확인 필수!"
+            else:
+                p['district_fmt'] = "-"
+                p['remark_fmt'] = "-"
+
+            for key in ['addr', '지목', '면적', '공시지가', '용도지역1', '개발제한구역']:
+                if key not in p: p[key] = "-"
+
+    if not geojson['features']:
+        lat, lon = 37.361446, 127.111488
+    else:
+        lat, lon = get_center_from_geojson(geojson)
+
+    m = folium.Map(location=[lat, lon], zoom_start=18, tiles=None)
+
+    folium.TileLayer(tiles=f"https://api.vworld.kr/req/wmts/1.0.0/{vworld_key}/Base/{{z}}/{{y}}/{{x}}.png",
+                     attr='VWorld Base', name='일반지도', overlay=False, control=True).add_to(m)
+    folium.TileLayer(tiles=f"https://api.vworld.kr/req/wmts/1.0.0/{vworld_key}/Satellite/{{z}}/{{y}}/{{x}}.jpeg",
+                     attr='VWorld Satellite', name='위성지도', overlay=False, control=True).add_to(m)
+    folium.TileLayer(tiles=f"https://api.vworld.kr/req/wmts/1.0.0/{vworld_key}/Hybrid/{{z}}/{{y}}/{{x}}.png",
+                     attr='VWorld Hybrid', name='하이브리드(도로/지명)', overlay=True, control=True).add_to(m)
+
+    # ==============================================================================
+    # [수정된 기능] WMS 레이어 그룹 정의 (단순 데이터만 정의)
+    # ==============================================================================
+    LAYER_GROUPS = {
+        "tab1": [  # 주요 규제 (Major Constraints)
+            {"name": "없음 (규제 끄기)", "id": "none"},
+            {"name": "개발제한구역", "id": "lt_c_ud801"},
+            {"name": "토지이용계획도", "id": "lt_c_lhblpn"},
+            {"name": "국가유산/보호구역", "id": "lt_c_uo301"},
+            {"name": "산업단지경계", "id": "lt_c_damdan"},
+            {"name": "산업단지용도지역", "id": "lt_c_damyod"},
+            {"name": "산업단지유치업종", "id": "lt_c_damyuch"},
+            {"name": "교육환경보호구역", "id": "lt_c_uo101"},
+            {"name": "자유무역지역", "id": "lt_c_uh402"},
+            {"name": "유통단지", "id": "lt_c_uh501"}
+        ],
+        "tab2": [  # 용도지역 16개 세분화 및 산업/연구 지구
+            {"name": "없음 (용도 끄기)", "id": "none"},
+            {"name": "도시지역", "id": "lt_c_uq111"},
+            {"name": "관리지역", "id": "lt_c_uq112"},
+            {"name": "도시계획시설", "id": "lt_c_upisuq153"},
+            {"name": "지구단위계획", "id": "lt_c_upisuq161"},
+            {"name": "도시자연공원", "id": "lt_c_uq162"},
+            {"name": "취락지구", "id": "lt_c_uq128"},
+            {"name": "제한고도", "id": "lt_l_aisrouteu"},
+            {"name": "국가산업단지", "id": "lt_c_wgisiegug"},
+            {"name": "일반산업단지", "id": "lt_c_wgisieilban"},
+            {"name": "첨단산업단지", "id": "lt_c_wgisiedosi"}
+        ]
+    }
+
+    # ★ WMS 레이어를 파이썬에서 미리 추가하지 않음! (속도 최적화)
+    # 대신 JavaScript가 클릭할 때마다 동적으로 로딩하도록 변경
+
+    def analysis_style_function(feature):
+        props = feature['properties']
+        addr = props.get('addr', '')
+        if addr in address_styles:
+            st = address_styles[addr]
+            return {'fillColor': st.get('fill', fill_color), 'color': st.get('stroke', stroke_color),
+                    'weight': stroke_weight, 'fillOpacity': st.get('opacity', fill_opacity)}
+        owner = props.get('소유구분', '')
+        try:
+            share_cnt = int(props.get('공유인수', 0))
+        except:
+            share_cnt = 0
+        if '개인' in owner:
+            base_color = '#FFD600'
+        elif any(x in owner for x in ['국', '도', '시', '군']):
+            base_color = '#1565C0'
+        elif '법인' in owner:
+            base_color = '#D32F2F'
+        else:
+            base_color = '#757575'
+        if share_cnt == 0:
+            opacity = 0.2
+        elif 1 <= share_cnt <= 2:
+            opacity = 0.4
+        elif 3 <= share_cnt <= 5:
+            opacity = 0.6
+        elif 6 <= share_cnt <= 10:
+            opacity = 0.7
+        elif 11 <= share_cnt <= 20:
+            opacity = 0.8
+        else:
+            opacity = 0.9
+        return {'fillColor': base_color, 'color': 'white', 'weight': 2, 'fillOpacity': opacity}
+
+    def clean_style_function(feature):
+        return {'fillColor': 'none', 'color': 'white', 'weight': 2, 'fillOpacity': 0}
+
+    if geojson['features']:
+        analysis_group = folium.FeatureGroup(name="소유주 분석도", show=True)
+        folium.GeoJson(
+            geojson,
+            style_function=analysis_style_function,
+            tooltip=folium.GeoJsonTooltip(
+                fields=['addr', '지목', '면적', '공시지가', '소유_fmt', '용도지역1', 'tooltip_bc', 'tooltip_vl', 'district_fmt',
+                        'remark_fmt', '건물명', '연면적_fmt'],
+                aliases=['주소', '지목', '면적(평)', '공시지가', '소유', '용도', '건폐율(현황/한계)', '용적률(현황/한계)', '지구단위계획', '비고', '건물명',
+                         '연면적'],
+                labels=True
+            )
+        ).add_to(analysis_group)
+        analysis_group.add_to(m)
+
+        clean_group = folium.FeatureGroup(name="기본 지적도(선)", show=False)
+        folium.GeoJson(geojson, style_function=clean_style_function, tooltip=None).add_to(clean_group)
+        clean_group.add_to(m)
+
+        try:
+            polys = [shape(f['geometry']) for f in geojson['features']]
+            from shapely.ops import unary_union
+            merged = unary_union(polys)
+            merged_gdf = gpd.GeoDataFrame(geometry=[merged])
+            merged_geojson = json.loads(merged_gdf.to_json())
+            folium.GeoJson(merged_geojson, name="전체 외곽선",
+                           style_function=lambda x: {'fillColor': 'none', 'color': 'white', 'weight': 4,
+                                                     'fillOpacity': 0}, tooltip=None).add_to(m)
+        except:
+            pass
+
+    folium.LayerControl(position='topleft', collapsed=False).add_to(m)
+
+    legend_html = """
+        <div style="position: fixed; bottom: 30px; right: 10px; width: 200px; height: auto; 
+                    border:2px solid grey; z-index:9998; font-size:12px; background-color:white;
+                    padding: 10px; border-radius: 5px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);">
+            <h5 style="margin-top:0; text-align:center;">📌 소유주 범례</h5>
+            <div style="margin-bottom:5px;"><span style="background:#FFD600; opacity:0.7; width:15px; height:15px; display:inline-block; vertical-align:middle; border:1px solid #ccc;"></span> 개인 (노랑)</div>
+            <div style="margin-bottom:5px;"><span style="background:#1565C0; opacity:0.7; width:15px; height:15px; display:inline-block; vertical-align:middle;"></span> 국/공유 (파랑)</div>
+            <div style="margin-bottom:5px;"><span style="background:#D32F2F; opacity:0.7; width:15px; height:15px; display:inline-block; vertical-align:middle;"></span> 법인 (빨강)</div>
+            <div style="margin-bottom:10px;"><span style="background:#757575; opacity:0.7; width:15px; height:15px; display:inline-block; vertical-align:middle;"></span> 기타 (회색)</div>
+            <hr>
+            <div style="text-align:center; font-size:11px; margin-bottom:5px;">공유인수 (진할수록 많음)</div>
+            <div style="background: linear-gradient(to right, rgba(0,0,0,0.2), rgba(0,0,0,0.9)); height: 10px; border:1px solid #ccc; margin-bottom: 2px;"></div>
+            <div style="display:flex; justify-content:space-between; font-size:10px; color:#555;"><span>0</span><span>1~3</span><span>4~10</span><span>11~20</span><span>21+</span></div>
+        </div>
+        """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    save_data = {"addresses": address_list, "styles": address_styles}
+    data_str = json.dumps(save_data, ensure_ascii=False)
+    m.get_root().html.add_child(
+        folium.Element(f'<script id="saved-map-data" type="application/json">{data_str}</script>'))
+
+    # ==============================================================================
+    # [수정됨] 라디오 버튼 기반의 동적 로딩 (속도 최적화)
+    # ==============================================================================
+    tab1_html = "".join([
+        f'<label><input type="radio" name="layerSelect" value="{l["id"]}" onclick="updateLayer(this.value)"> {l["name"]}</label><br>'
+        for l in LAYER_GROUPS["tab1"]])
+    tab2_html = "".join([
+        f'<label><input type="radio" name="layerSelect" value="{l["id"]}" onclick="updateLayer(this.value)"> {l["name"]}</label><br>'
+        for l in LAYER_GROUPS["tab2"]])
+
+    # VWorld API Key를 JS로 전달하기 위해 변수 생성
+    js_vworld_key = vworld_key
+
+    custom_control = f"""
+    <div id="layer-panel" style="position:fixed; bottom:20px; left:20px; width:220px; background:white; border:2px solid #333; z-index:9999; border-radius:5px; box-shadow:3px 3px 5px rgba(0,0,0,0.3);">
+        <div id="panel-header" style="background:#333; color:white; padding:5px; cursor:move; display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-weight:bold;">규제/용도 확인</span>
+            <button onclick="togglePanel()" style="background:none; border:none; color:white; font-weight:bold; cursor:pointer;">_</button>
+        </div>
+        <div id="panel-content" style="padding:10px; max-height:400px; overflow-y:auto;">
+            <div style="display:flex; border-bottom:1px solid #ccc; margin-bottom:10px;">
+                <button onclick="showTab('tab1')" style="flex:1; padding:5px; border:none; background:#eee; cursor:pointer; font-weight:bold;" id="btn-tab1">주요 규제</button>
+                <button onclick="showTab('tab2')" style="flex:1; padding:5px; border:none; background:white; cursor:pointer;" id="btn-tab2">용도/지구</button>
+            </div>
+            <div id="tab1-content" style="display:block; font-size:12px;">{tab1_html}</div>
+            <div id="tab2-content" style="display:none; font-size:12px;">{tab2_html}</div>
+        </div>
+    </div>
+    <script>
+        // 드래그 및 최소화 (기존 동일)
+        var panel = document.getElementById("layer-panel");
+        var header = document.getElementById("panel-header");
+        var isDragging = false, offsetX, offsetY;
+        header.onmousedown = function(e) {{ isDragging = true; offsetX = e.clientX - panel.offsetLeft; offsetY = e.clientY - panel.offsetTop; }};
+        document.onmousemove = function(e) {{ if(isDragging) {{ panel.style.left = (e.clientX - offsetX) + "px"; panel.style.top = (e.clientY - offsetY) + "px"; panel.style.bottom = "auto"; }} }};
+        document.onmouseup = function() {{ isDragging = false; }};
+        function togglePanel() {{ var c = document.getElementById("panel-content"); c.style.display = c.style.display === "none" ? "block" : "none"; }}
+
+        function showTab(tabId) {{
+            document.getElementById("tab1-content").style.display = tabId === "tab1" ? "block" : "none";
+            document.getElementById("tab2-content").style.display = tabId === "tab2" ? "block" : "none";
+            document.getElementById("btn-tab1").style.background = tabId === "tab1" ? "#eee" : "white";
+            document.getElementById("btn-tab1").style.fontWeight = tabId === "tab1" ? "bold" : "normal";
+            document.getElementById("btn-tab2").style.background = tabId === "tab2" ? "#eee" : "white";
+            document.getElementById("btn-tab2").style.fontWeight = tabId === "tab2" ? "bold" : "normal";
+        }}
+
+        // [핵심] 동적 레이어 로딩 시스템
+        var currentOverlay = null; // 현재 켜진 레이어 저장용
+
+        function updateLayer(layerId) {{
+            // 1. 기존 레이어가 있으면 지도에서 제거 (메모리 확보)
+            var map = null;
+            for(var key in window) {{ if(window[key] instanceof L.Map) {{ map = window[key]; break; }} }}
+            if(!map) return;
+
+            if (currentOverlay) {{
+                map.removeLayer(currentOverlay);
+                currentOverlay = null;
+            }}
+
+            // 2. '없음' 선택 시 종료
+            if (layerId === 'none') return;
+
+            // 3. 새 레이어 생성 및 추가
+            var serviceKey = "{js_vworld_key}";
+            var newLayer = L.tileLayer.wms("http://api.vworld.kr/req/wms?", {{
+                layers: layerId,
+                styles: layerId,
+                format: 'image/png',
+                transparent: true,
+                version: '1.3.0',
+                key: serviceKey, // 키 전달
+                crs: L.CRS.EPSG3857, // 좌표계 설정
+                opacity: 0.7
+            }});
+
+            newLayer.addTo(map);
+            currentOverlay = newLayer; // 현재 레이어로 등록
+        }}
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(custom_control))
+
+    control_html = f"""
+    <div id="ui-controls" style="
+        position: fixed;
+        top: 10px;
+        right: 10px; width: 220px;
+        background-color: white; padding: 15px; border: 2px solid black;
+        z-index: 9999; font-family: sans-serif;
+        box-shadow: 3px 3px 5px rgba(0,0,0,0.3); border-radius: 8px;
+        max-height: 90vh; overflow-y: auto;">
+        <h4 style="margin-top:0;
+        margin-bottom:10px;">🛠️ 지도 스타일</h4>
+        <div id="selectionStatus" style="background: #eee; padding: 8px; margin-bottom: 10px; border-radius: 4px;
+        font-size: 13px; font-weight: bold; color: #333;">현재: 전체 필지 수정 중</div>
+        <button onclick="resetSelection()" style="width:100%;
+        padding:5px; margin-bottom:10px; background:#f44336; color:white; border:none; border-radius:4px; cursor:pointer;">전체 모드로 복귀</button>
+        <hr style="margin-bottom:10px;">
+        <label style="font-size:12px;"><b>선 색상</b></label>
+        <input type="color" id="strokeColor" value="{stroke_color}" style="width:40px;
+        float:right; cursor:pointer;"><br style="clear:both; margin-bottom:5px;">
+        <label style="font-size:12px;"><b>선 두께: <span id="weightVal">{stroke_weight}</span>px</b></label>
+        <input type="range" id="strokeWeight" min="0" max="10" step="1" value="{stroke_weight}" style="width:100%;
+        cursor:pointer;" oninput="document.getElementById('weightVal').innerText=this.value"><br>
+        <label style="font-size:12px;"><b>채움 색상</b></label>
+        <input type="color" id="fillColor" value="{fill_color}" style="width:40px;
+        float:right; cursor:pointer;"><br style="clear:both; margin-bottom:5px;">
+        <label style="font-size:12px;"><b>투명도: <span id="opVal">{fill_opacity}</span></b></label>
+        <input type="range" id="fillOpacity" min="0" max="1" step="0.1" value="{fill_opacity}" style="width:100%;
+        cursor:pointer;" oninput="document.getElementById('opVal').innerText=this.value">
+        <br><br>
+        <button onclick="updateMapStyle()" style="width:100%;
+        padding:10px; background:#4CAF50; color:white; border:none; border-radius:4px; font-weight:bold; cursor:pointer;">스타일 적용하기</button>
+        <hr style="margin-top:15px;
+        margin-bottom:15px;">
+        <button onclick="downloadMap()" style="width:100%; padding:10px; background:#2196F3; color:white; border:none; border-radius:4px; font-weight:bold;
+        cursor:pointer;">💾 현재 상태 저장(다운로드)</button>
+        <p style="font-size:11px; color:gray;
+        margin-top:5px;">* 수정한 내용을 저장하려면 위 버튼을 눌러 새 파일을 받으세요.</p>
+    </div>
+    <script>
+        var selectedLayer = null; 
+        window.onload = function() {{ initLayerClicks(); }};
+        function findMapInstance() {{ for (var key in window) {{ if (window[key] instanceof L.Map) return window[key]; }} return null; }}
+        function initLayerClicks() {{
+            var mapInstance = findMapInstance();
+            if (!mapInstance) {{ setTimeout(initLayerClicks, 500); return; }}
+            mapInstance.eachLayer(function(layer) {{
+                if (layer.feature && layer.setStyle && layer.options && layer.options.fillOpacity !== 0) {{
+                    layer.on('click', function(e) {{ selectedLayer = e.target; var props = selectedLayer.feature.properties; var addr = props.addr || "선택된 필지"; document.getElementById('selectionStatus').innerHTML = "현재: <span style='color:blue;'>" + addr + "</span> 수정 중"; document.getElementById('selectionStatus').style.background = 
+                    "#e3f2fd"; L.DomEvent.stopPropagation(e); }});
+                }}
+            }});
+        }}
+        function resetSelection() {{ selectedLayer = null;
+        document.getElementById('selectionStatus').innerHTML = "현재: 전체 필지 수정 중"; document.getElementById('selectionStatus').style.background = "#eee";
+        }}
+        function updateMapStyle() {{
+            var stroke = document.getElementById('strokeColor').value;
+            var fill = document.getElementById('fillColor').value;
+            var opacity = parseFloat(document.getElementById('fillOpacity').value);
+            var weight = parseInt(document.getElementById('strokeWeight').value);
+            if (selectedLayer) {{ 
+                selectedLayer.setStyle({{ color: stroke, weight: weight, fillColor: fill, fillOpacity: opacity }});
+                var dataTag = document.getElementById('saved-map-data');
+                var addr = selectedLayer.feature.properties.addr;
+                if (dataTag && addr) {{
+                    try {{ var data = JSON.parse(dataTag.textContent);
+                    if (!data.styles) data.styles = {{}}; data.styles[addr] = {{ 'stroke': stroke, 'fill': fill, 'opacity': opacity }}; dataTag.textContent = JSON.stringify(data);
+                    }} catch(e) {{ }}
+                }}
+            }} else {{ 
+                var mapInstance = findMapInstance();
+                if (!mapInstance) return; 
+                mapInstance.eachLayer(function(layer) {{ if (layer.feature && layer.setStyle && layer.options && layer.options.fillOpacity !== 0) {{ layer.setStyle({{ color: stroke, weight: weight, fillColor: fill, fillOpacity: opacity }}); }} }});
+            }}
+        }}
+        function downloadMap() {{
+            var htmlContent = document.documentElement.outerHTML;
+            var blob = new Blob([htmlContent], {{type: 'text/html'}});
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'modified_map.html'; 
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }}
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(control_html))
+    m.save(output_file)
+    try:
+        webbrowser.open(output_file)
+    except:
+        pass
+
+
+def run_gui():
+    root = tk.Tk()
+    root.title("지적도 GUI by chanyoung)")
+    root.geometry("970x570")
+
+    address_list = []
+    address_styles = {}
+
+    stroke_color_var = tk.StringVar(value="#FFA500")
+    fill_color_var = tk.StringVar(value="#ffffff")
+    fill_opacity_var = tk.DoubleVar(value=0.2)
+    stroke_weight_var = tk.IntVar(value=2)
+
+    def add_addr():
+        sido = sido_var.get()
+        sigungu = sigungu_var.get()
+        dong = dong_entry.get().strip()
+        jibun = jibun_entry.get().strip()
+        if not (sido and sigungu and dong and jibun):
+            messagebox.showerror("오류", "모든 주소 정보를 입력하세요.")
+            return
+        full_address = f"{sido} {sigungu} {dong} {jibun}"
+        if full_address in address_list:
+            messagebox.showinfo("알림", "이미 리스트에 존재하는 주소입니다.")
+            return
+        address_list.append(full_address)
+        checklist.insert(tk.END, full_address)
+
+    def add_sigungu_to_addresses():
+        sido = sido_var.get()
+        sigungu = sigungu_var.get()
+        if not sido:
+            messagebox.showerror("오류", "시도를 선택하세요.")
+            return
+        prefix = sido if not sigungu else f"{sido} {sigungu}"
+        for i in range(len(address_list)):
+            addr = address_list[i]
+            if addr.startswith(f"{prefix} "): continue
+            address_list[i] = f"{prefix} {addr}"
+        checklist.delete(0, tk.END)
+        for addr in address_list: checklist.insert(tk.END, addr)
+        messagebox.showinfo("완료", f"{prefix}가 주소 앞에 추가되었습니다.")
+
+    def csv_import():
+        base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(
+            os.path.abspath(__file__))
+        csv_file = os.path.join(base_dir, "input.csv")
+        if not os.path.exists(csv_file):
+            messagebox.showerror("오류", "input.csv 파일이 없습니다.")
+            return
+        try:
+            df = pd.read_csv(csv_file, encoding="utf-8-sig")
+            count_added = 0
+            count_dup = 0
+            for row in df.iloc[:, 0]:
+                addr = str(row).strip()
+                if addr:
+                    if addr not in address_list:
+                        address_list.append(addr)
+                        checklist.insert("end", addr)
+                        count_added += 1
+                    else:
+                        count_dup += 1
+            if count_dup > 0:
+                messagebox.showinfo("완료", f"{count_added}개 추가 완료.\n(중복 {count_dup}건 제외)")
+            else:
+                messagebox.showinfo("완료", f"{count_added}개 주소 추가 완료.")
+        except Exception as e:
+            messagebox.showerror("CSV 파일 읽기 오류", str(e))
+
+    def delete_selected():
+        selected = checklist.curselection()
+        for index in reversed(selected):
+            checklist.delete(index)
+            del address_list[index]
+
+    def standardize_addresses():
+        if not address_list:
+            messagebox.showinfo("안내", "표준화할 주소가 없습니다.")
+            return
+        sido_mapping = {
+            "서울": "서울특별시", "부산": "부산광역시", "대구": "대구광역시", "인천": "인천광역시",
+            "광주": "광주광역시", "대전": "대전광역시", "울산": "울산광역시", "세종": "세종특별자치시",
+            "경기": "경기도", "강원": "강원특별자치도", "충북": "충청북도", "충남": "충청남도",
+            "전북": "전북특별자치도", "전남": "전라남도", "경북": "경상북도", "경남": "경상남도",
+            "제주": "제주특별자치도"
+        }
+        sido_pattern = "|".join(sido_mapping.keys())
+
+        def normalize_address(addr):
+            addr = re.sub(r"\(.*?\)", "", addr).strip()
+            match = re.match(rf"({sido_pattern})(시|도|광역시|특별시|특별자치시|특별자치도)?", addr)
+            if match:
+                raw_sido = match.group(1)
+                full_sido = sido_mapping.get(raw_sido, raw_sido)
+                rest = addr[match.end():].lstrip()
+                return f"{full_sido} {rest}".strip()
+            for sido, sigungus in sigungu_dict.items():
+                for sigungu in sigungus:
+                    if addr.startswith(sigungu):
+                        rest = addr[len(sigungu):].lstrip()
+                        return f"{sido} {sigungu} {rest}".strip()
+            return addr.strip()
+
+        for i in range(len(address_list)): address_list[i] = normalize_address(address_list[i])
+        checklist.delete(0, tk.END)
+        for addr in address_list: checklist.insert(tk.END, addr)
+        messagebox.showinfo("완료", "주소 표준화가 완료되었습니다.")
+
+    def load_map_from_html():
+        result_dir = os.path.join(base_dir, "result")
+        if not os.path.exists(result_dir): messagebox.showinfo("알림", "result 폴더가 없습니다."); return
+        files = [f for f in os.listdir(result_dir) if f.endswith(".html")]
+        if not files: messagebox.showinfo("알림", "저장된 지도 파일이 없습니다."); return
+        top = tk.Toplevel(root)
+        top.title("지도 불러오기")
+        top.geometry("300x400")
+        tk.Label(top, text="불러올 지도를 선택하세요:").pack(pady=10)
+        listbox = tk.Listbox(top, selectmode=tk.SINGLE)
+        listbox.pack(expand=True, fill="both", padx=10, pady=5)
+        for f in files: listbox.insert(tk.END, f)
+
+        def do_load():
+            selection = listbox.curselection()
+            if not selection: return
+            filename = listbox.get(selection[0])
+            fpath = os.path.join(result_dir, filename)
+            top.destroy()
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                match = re.search(r'<script id="saved-map-data" type="application/json">(.*?)</script>', content)
+                if match:
+                    data = json.loads(match.group(1))
+                    address_list.clear()
+                    checklist.delete(0, tk.END)
+                    address_styles.clear()
+                    loaded_addrs = data.get('addresses', [])
+                    loaded_styles = data.get('styles', {})
+                    for addr in loaded_addrs:
+                        address_list.append(addr)
+                        checklist.insert(tk.END, addr)
+                    for k, v in loaded_styles.items(): address_styles[k] = v
+                    messagebox.showinfo("완료", f"'{filename}'에서 {len(loaded_addrs)}개의 주소를 불러왔습니다.")
+                else:
+                    messagebox.showerror("실패", "지도 데이터가 없습니다.")
+            except Exception as e:
+                messagebox.showerror("오류", f"파일 읽기 실패: {e}")
+
+        tk.Button(top, text="선택한 파일 불러오기", command=do_load, bg="#4CAF50", fg="white").pack(pady=10, fill='x', padx=10)
+
+    def apply_style_to_selected():
+        selected_indices = checklist.curselection()
+        if not selected_indices: messagebox.showwarning("알림", "선택된 주소가 없습니다."); return
+        style = {"stroke": stroke_color_var.get(), "fill": fill_color_var.get(), "opacity": fill_opacity_var.get()}
+        for i in selected_indices:
+            addr = checklist.get(i)
+            address_styles[addr] = style.copy()
+        messagebox.showinfo("완료", "선택된 주소에 스타일이 적용되었습니다.")
+
+    def process_address_worker(addr, stop_event):
+        try:
+            if stop_event.is_set(): return []
+            try:
+                pnu = address_to_pnu(addr)
+            except Exception as e:
+                return [{"type": "Feature", "geometry": None,
+                         "properties": {"addr": addr, "지목": "실패", "건물명": f"주소오류: {str(e)}"}}]
+
+            try:
+                gj = get_geojson_by_pnu(pnu, stop_event)
+                processed = []
+                if gj and "features" in gj:
+                    for f in gj["features"]:
+                        if "properties" not in f: f["properties"] = {}
+                        f["properties"]["addr"] = addr
+                        processed.append(f)
+                return processed
+            except Exception as e:
+                return [{"type": "Feature", "geometry": None,
+                         "properties": {"addr": addr, "지목": "실패", "건물명": f"API오류: {str(e)}"}}]
+        except:
+            return [{"type": "Feature", "geometry": None, "properties": {"addr": addr, "지목": "실패", "건물명": "알수없는 오류"}}]
+
+    def run_process(mode="map"):
+        if not address_list and mode == "excel": messagebox.showerror("오류", "주소가 없습니다."); return
+
+        title_text = "지도 데이터 생성 중..." if mode == "map" else "엑셀 데이터 수집 중..."
+        progress_win = tk.Toplevel()
+        progress_win.title(title_text)
+        progress_win.geometry("400x150")
+
+        lbl_status = tk.Label(progress_win, text=f"총 {len(address_list)}개 처리 시작 (안전모드)...")
+        lbl_status.pack(pady=10)
+        progress_bar = ttk.Progressbar(progress_win, maximum=len(address_list), length=300, mode="determinate")
+        progress_bar.pack(pady=10)
+        stop_event = threading.Event()
+
+        def on_stop():
+            stop_event.set()
+            lbl_status.config(text="🛑 중단 요청됨! 마무리 중...")
+            btn_stop.config(state="disabled")
+
+        btn_stop = tk.Button(progress_win, text="중단 및 저장", command=on_stop, bg="#ffdddd")
+        btn_stop.pack(pady=5)
+
+        def run_thread():
+            global excel_features
+            with data_lock:
+                excel_features = []
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_addr = {executor.submit(process_address_worker, addr, stop_event): addr for addr in
+                                  address_list}
+                count = 0
+                for future in concurrent.futures.as_completed(future_to_addr):
+                    if stop_event.is_set() or not progress_win.winfo_exists(): break
+                    try:
+                        res = future.result()
+                        if res:
+                            with data_lock: excel_features.extend(res)
+                    except:
+                        pass
+                    count += 1
+                    try:
+                        progress_bar["value"] = count
+                        if count % 10 == 0 or count == len(address_list): lbl_status.config(
+                            text=f"진행: {count} / {len(address_list)} ({(count / len(address_list)) * 100:.1f}%)")
+                        progress_win.update_idletasks()
+                    except:
+                        pass
+            if progress_win.winfo_exists(): progress_win.destroy()
+            if not excel_features:
+                if mode == "excel": messagebox.showerror("실패", "수집된 데이터가 없습니다.")
+                return
+
+            # 실패건 카운트
+            fail_count = len([f for f in excel_features if f.get('properties', {}).get('지목') == '실패'])
+            success_count = len(excel_features) - fail_count
+
+            if success_count == 0 and fail_count > 0:
+                messagebox.showerror("API 오류", "모든 주소 수집 실패.")
+            elif fail_count > 0:
+                messagebox.showwarning("완료 (일부 실패)", f"{success_count}건 성공, {fail_count}건 실패.")
+            else:
+                messagebox.showinfo("완료", f"{success_count}건 성공!")
+
+            if mode == "map":
+                valid_features = [f for f in excel_features if f.get('geometry')]
+                unique_valid = []
+                seen = set()
+                for f in valid_features:
+                    addr = f['properties'].get('addr')
+                    if addr and addr not in seen:
+                        seen.add(addr)
+                        unique_valid.append(f)
+                if not unique_valid: return
+                features_collection = {"type": "FeatureCollection", "features": unique_valid}
+                root.after(0, lambda: create_map_with_outer_and_inner_layers(features_collection, address_list,
+                                                                             address_styles, stroke_color_var.get(),
+                                                                             fill_color_var.get(),
+                                                                             fill_opacity_var.get(),
+                                                                             stroke_weight_var.get()))
+            else:
+                root.after(0, save_to_excel)
+
+        threading.Thread(target=run_thread, daemon=True).start()
+
+    frame_top = tk.Frame(root)
+    frame_top.pack(fill="x", padx=10, pady=5)
+    tk.Label(frame_top, text="시도").pack(side="left")
+    sido_var = tk.StringVar()
+    sido_combo = ttk.Combobox(frame_top, textvariable=sido_var, values=sido_list, state="readonly", width=14)
+    sido_combo.pack(side="left", padx=2)
+    sido_combo.bind("<<ComboboxSelected>>",
+                    lambda e: sigungu_combo.config(values=sigungu_dict.get(sido_var.get(), [])) or sigungu_var.set(""))
+    tk.Label(frame_top, text="시군구").pack(side="left")
+    sigungu_var = tk.StringVar()
+    sigungu_combo = ttk.Combobox(frame_top, textvariable=sigungu_var, state="readonly", width=16)
+    sigungu_combo.pack(side="left", padx=2)
+    tk.Label(frame_top, text="동").pack(side="left")
+    dong_entry = tk.Entry(frame_top, width=10)
+    dong_entry.pack(side="left", padx=2)
+    tk.Label(frame_top, text="지번").pack(side="left")
+    jibun_entry = tk.Entry(frame_top, width=10)
+    jibun_entry.pack(side="left", padx=2)
+    tk.Button(frame_top, text="주소 추가", width=10, command=add_addr).pack(side="left", padx=(10, 2))
+
+    frame_main = tk.Frame(root)
+    frame_main.pack(fill="both", expand=True, padx=10, pady=10)
+    frame_left = tk.LabelFrame(frame_main, text="기능 실행", bd=2, relief="solid")
+    frame_left.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+    frame_main.grid_columnconfigure(0, weight=1)
+    frame_main.grid_rowconfigure(0, weight=1)
+    checklist = tk.Listbox(frame_left, height=16, selectmode=tk.EXTENDED, width=10)
+    checklist.grid(row=0, column=0, columnspan=4, padx=10, pady=(10, 2), sticky="nsew")
+    frame_left.grid_rowconfigure(0, weight=1)
+    for i in range(4): frame_left.grid_columnconfigure(i, weight=1)
+    tk.Button(frame_left, text="CSV 불러오기", width=13, command=csv_import).grid(row=1, column=0, padx=2, pady=2,
+                                                                              sticky="we")
+    tk.Button(frame_left, text="선택 주소 삭제", width=13, command=delete_selected).grid(row=2, column=0, padx=2, pady=2,
+                                                                                   sticky="we")
+    tk.Button(frame_left, text="주소 표준화", width=13, command=standardize_addresses).grid(row=3, column=0, padx=2, pady=2,
+                                                                                       sticky="we")
+    tk.Button(frame_left, text="기존 지도 불러오기", width=13, command=load_map_from_html).grid(row=3, column=1, padx=2, pady=2,
+                                                                                        sticky="we")
+    tk.Button(frame_left, text="지도 생성", width=13, command=lambda: run_process("map")).grid(row=1, column=1, padx=2,
+                                                                                           pady=2, sticky="we")
+    tk.Button(frame_left, text="엑셀 저장", width=13, command=lambda: run_process("excel")).grid(row=2, column=1, padx=2,
+                                                                                             pady=2, sticky="we")
+
+    frame_right_container = tk.Frame(frame_main)
+    frame_right_container.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+    frame_main.grid_columnconfigure(1, weight=2)
+    frame_right = tk.LabelFrame(frame_right_container, text="스타일 설정 (기본값)", bd=2, relief="solid", height=270)
+    frame_right.pack(fill="x", pady=(0, 10))
+    frame_right.pack_propagate(False)
+    tk.Label(frame_right, text="선 색상").pack()
+    tk.Button(frame_right, text="선 색상 선택", width=13,
+              command=lambda: stroke_color_var.set(colorchooser.askcolor(initialcolor=stroke_color_var.get())[1])).pack(
+        pady=2)
+    tk.Label(frame_right, text="채움 색상").pack()
+    tk.Button(frame_right, text="채움 색상 선택", width=13,
+              command=lambda: fill_color_var.set(colorchooser.askcolor(initialcolor=fill_color_var.get())[1])).pack(
+        pady=2)
+    tk.Label(frame_right, text="채움 투명도 (0.0 ~ 1.0)").pack()
+    tk.Entry(frame_right, textvariable=fill_opacity_var, width=13).pack(pady=(0, 5))
+    tk.Button(frame_right, text="선택 주소 스타일 적용", width=13, command=apply_style_to_selected).pack(pady=6)
+    frame_guide = tk.LabelFrame(frame_right_container, text="사용법", bd=2, relief="solid", height=80)
+    frame_guide.pack(fill="both", expand=True)
+    tk.Label(frame_guide, text="[대용량 안전모드]\n1. 10개씩 천천히 조회합니다 (API 차단 방지)\n2. 누락 시 3번 재시도합니다.\n3. 저장 시 중복을 자동 제거합니다.",
+             justify="left").pack(anchor="w", padx=10, pady=5)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    run_gui()
