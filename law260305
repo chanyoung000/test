@@ -1,0 +1,177 @@
+"""
+법령 AI 검색 - 로컬 서버
+HTML 파일을 서빙하고 법제처 API(law.go.kr)를 중계합니다.
+
+사용법: 법령_AI_검색.bat 더블클릭 (또는 python law_proxy.py)
+서버 주소: http://127.0.0.1:18380
+"""
+
+import http.server
+import urllib.request
+import urllib.parse
+import ssl
+import json
+import os
+import sys
+import webbrowser
+import mimetypes
+
+HOST = '127.0.0.1'
+PORT = 18380
+ALLOWED_HOSTS = ['www.law.go.kr']
+# PyInstaller EXE: sys.executable의 폴더, 일반 Python: __file__의 폴더
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 서빙 가능한 정적 파일
+STATIC_FILES = {
+    '/': '법령_AI_검색.html',
+    '/config.js': 'config.js',
+}
+
+
+class LawProxyHandler(http.server.BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._set_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        # 정적 파일 서빙
+        if self.path in STATIC_FILES or self.path == '/favicon.ico':
+            self._serve_static()
+            return
+
+        # /health
+        if self.path == '/health':
+            self.send_response(200)
+            self._set_cors_headers()
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'ok', 'port': PORT}).encode('utf-8'))
+            return
+
+        # /proxy?url=...
+        if self.path.startswith('/proxy?'):
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            target_url = params.get('url', [None])[0]
+            if not target_url:
+                self._send_error(400, 'url 파라미터가 필요합니다.')
+                return
+            try:
+                target_parsed = urllib.parse.urlparse(target_url)
+                if target_parsed.hostname not in ALLOWED_HOSTS:
+                    self._send_error(403, '허용되지 않은 호스트: ' + str(target_parsed.hostname))
+                    return
+            except Exception:
+                self._send_error(400, '잘못된 URL')
+                return
+            self._proxy_request(target_url)
+            return
+
+        # /api/lawSearch?... 또는 /api/lawService?...
+        if self.path.startswith('/api/'):
+            api_path = self.path[5:]
+            if api_path.startswith('lawSearch.do') or api_path.startswith('lawService.do'):
+                self._proxy_request('https://www.law.go.kr/DRF/' + api_path)
+                return
+            self._send_error(404, '알 수 없는 API 경로')
+            return
+
+        self._send_error(404, 'Not found')
+
+    def _serve_static(self):
+        filename = STATIC_FILES.get(self.path)
+        if not filename:
+            self.send_response(404)
+            self.end_headers()
+            return
+        filepath = os.path.join(BASE_DIR, filename)
+        if not os.path.isfile(filepath):
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(f'{filename} not found'.encode('utf-8'))
+            return
+        content_type, _ = mimetypes.guess_type(filepath)
+        if not content_type:
+            content_type = 'text/html; charset=utf-8'
+        elif 'javascript' in content_type:
+            content_type = 'application/javascript; charset=utf-8'
+        elif 'html' in content_type:
+            content_type = 'text/html; charset=utf-8'
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _proxy_request(self, target_url):
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(target_url)
+            req.add_header('User-Agent', 'Mozilla/5.0 LawProxy/1.0')
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+                data = resp.read()
+                content_type = resp.headers.get('Content-Type', 'text/xml; charset=utf-8')
+            self.send_response(200)
+            self._set_cors_headers()
+            self.send_header('Content-Type', content_type)
+            self.end_headers()
+            self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            self._send_error(e.code, str(e.reason))
+        except urllib.error.URLError as e:
+            self._send_error(502, 'API 서버 연결 실패: ' + str(e.reason))
+        except Exception as e:
+            self._send_error(500, str(e))
+
+    def _set_cors_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
+
+    def _send_error(self, code, message):
+        self.send_response(code)
+        self._set_cors_headers()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({'error': message}, ensure_ascii=False).encode('utf-8'))
+
+    def log_message(self, format, *args):
+        print(f"  {args[0]}")
+
+
+def main():
+    import warnings
+    warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+
+    server = http.server.HTTPServer((HOST, PORT), LawProxyHandler)
+    url = f'http://{HOST}:{PORT}'
+    print()
+    print(f"  ┌────────────────────────────────────────┐")
+    print(f"  │   법령 AI 검색 서버                     │")
+    print(f"  │   {url}                │")
+    print(f"  │   브라우저가 자동으로 열립니다          │")
+    print(f"  │   종료: 이 창을 닫거나 Ctrl+C          │")
+    print(f"  └────────────────────────────────────────┘")
+    print()
+
+    # 브라우저 자동 열기
+    webbrowser.open(url)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  서버 종료")
+        server.server_close()
+
+
+if __name__ == '__main__':
+    main()
