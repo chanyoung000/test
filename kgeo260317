@@ -1,0 +1,233 @@
+import time
+import os
+from selenium import webdriver
+from openpyxl import Workbook
+import traceback
+import pandas as pd
+import openpyxl
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+# ==========================================
+# 1. 파일 저장 경로 설정 (절대 경로 방식)
+# ==========================================
+# 현재 실행 중인 파이썬 파일(owner.py)의 위치를 찾습니다.
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 저장할 폴더와 파일명을 지정합니다. (현재위치/find/소유자조회결과.xlsx)
+save_folder = os.path.join(current_dir, 'find')
+save_path = os.path.join(save_folder, '소유자조회결과.xlsx')
+# 주소 목록 읽기
+input_csv_path = "주소.csv" # 값 수정 가능
+address_df = pd.read_csv(input_csv_path, encoding='utf-8-sig')
+address_list = address_df.iloc[:, 0].dropna().tolist()
+
+# 'find' 폴더가 없으면 자동으로 만듭니다. (에러 방지)
+if not os.path.exists(save_folder):
+    os.makedirs(save_folder)
+    print(f"알림: '{save_folder}' 폴더를 생성했습니다.")
+
+# ==========================================
+# 2. 웹드라이버 설정 (최신 속도 개선 버전)
+# ==========================================
+options = webdriver.ChromeOptions()
+# 브라우저 꺼짐 방지 (테스트용)
+options.add_experimental_option("detach", True)
+# 필요 시 헤드리스 모드 등 옵션 추가
+# options.add_argument("--headless")
+
+print("브라우저를 실행합니다...")
+
+# [핵심] Service 설정 없이 바로 실행 (속도 빠름)
+driver = webdriver.Chrome(options=options)
+
+# ==========================================
+# 3. 크롤링 로직 (여기에 작성)
+# ==========================================
+# 엑셀 결과파일 생성
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = "소유자정보"
+ws.append(["주소", "구분", "소유자", "지목", "면적", "공시지가"])
+
+try:
+    driver.get("https://kgeop.go.kr/info/infoMap.do?initMode=L")
+    wait = WebDriverWait(driver, 30)
+
+    # 도움말 팝업 닫기
+    try:
+        popup_close = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnHelpClose")))
+        popup_close.click()
+        print("✅ 도움말 팝업 닫기 완료")
+    except:
+        print("ℹ️ 팝업 없음 또는 자동 닫힘")
+
+    for address in address_list:
+        try:
+            print(f"\n📍 주소 조회: {address}")
+
+            search_input = wait.until(EC.element_to_be_clickable((By.ID, "josuKeyword")))
+            search_input.clear()
+            search_input.send_keys(address)
+
+            search_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnSearch")))
+            search_button.click()
+
+            # ✅ 로딩창 사라질 때까지 기다림
+            wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.loading.type02")))
+
+            # jusoTotalCount 값 확인 (검색결과 수)
+            try:
+                total_count_el = wait.until(EC.presence_of_element_located((By.ID, "jusoTotalCount")))
+                total_count = int(total_count_el.text.strip().replace(",", ""))
+                if total_count == 0:
+                    print(f"❌ 검색 결과 없음: {address}")
+                    ws.append([address, "검색 실패", "", "", "", ""])
+                    continue
+            except:
+                print(f"❌ jusoTotalCount 확인 실패: {address}")
+                ws.append([address, "검색 실패", "", "", "", ""])
+                continue
+
+            # 주소 클릭 시도
+            import re
+
+            try:
+                # 모든 주소 항목이 로드될 때까지 대기
+                addr_items = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.addrArea")))
+                clicked = False
+
+                # 입력 주소에서 '동'과 '지번' 추출
+                dong_match = re.search(r"([가-힣]+동)", address)
+                jibun_match = re.search(r"\d+-\d+|\d+", address)
+
+                dong = dong_match.group(1) if dong_match else ""
+                jibun = jibun_match.group(0) if jibun_match else ""
+
+                for item in addr_items:
+                    jibun_el = item.find_element(By.CSS_SELECTOR, "p.jibun")
+                    jibun_text = jibun_el.text
+
+                    # 동명과 지번이 모두 포함될 때만 클릭
+                    if dong in jibun_text and jibun in jibun_text:
+                        item.click()
+                        clicked = True
+                        break
+
+                if not clicked:
+                    raise Exception("동+지번 일치 항목 없음")
+            except:
+                print(f"❌ 주소 클릭 실패: {address}")
+                ws.append([address, "주소 클릭 실패", "", "", "", ""])
+                continue
+
+            # ✅ 로딩창 다시 사라질 때까지 기다림
+            wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.loading.type02")))
+
+            # 상세정보 버튼 클릭
+            try:
+                more_info_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnMoreInfo")))
+                more_info_btn.click()
+                time.sleep(3)
+                print(f" 상세정보 버튼 클릭 성공: {address}")
+            except:
+                print(f"❌ 상세정보 버튼 클릭 실패: {address}")
+                ws.append([address, "상세정보 클릭 실패", "", "", "", ""])
+                continue
+
+            # 소유자 정보
+            # 여러 소유자 행 중에서 첫 번째 유효한 row 찾기
+            rows = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "tbody.shrYmbList tr")))
+            valid_row = None
+
+            for row in rows:
+                tds = row.find_elements(By.TAG_NAME, "td")
+                if len(tds) >= 2:  # 소유자 정보 포함 여부 확인
+                    valid_row = tds
+                    break
+
+            if valid_row is None:
+                print(f"[WARN] {address} - 소유자 정보 없음 (td 없는 tr만 존재)")
+                ws.append([address, "소유자 정보 없음", "", "", "", "", "", "", ""])
+                continue
+
+            owner_type = valid_row[0].text.strip()
+            owner_name = valid_row[1].text.strip()
+
+            # 지목/면적
+            try:
+                print(f"[STEP] {address} - 지목/면적 추출 시도")
+
+                land_rows = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "tbody.landLedgRst tr")))
+                valid_land_row = None
+
+                for row in land_rows:
+                    tds = row.find_elements(By.TAG_NAME, "td")
+                    if len(tds) >= 2:
+                        valid_land_row = tds
+                        break
+
+                if valid_land_row is None:
+                    print(f"[WARN] {address} - 지목/면적 정보 없음")
+                    ws.append([address, "지목/면적 정보 없음", owner_name, "", "", "", "", "", ""])
+                    continue
+
+                land_type = valid_land_row[0].text.strip()
+                land_area = valid_land_row[1].text.strip()
+                print(f"[STEP] {address} - 지목: {land_type}, 면적: {land_area}")
+
+            except Exception as e:
+                print(f"[ERROR] {address} - 지목/면적 추출 실패")
+                traceback.print_exc()
+                ws.append([address, "지목/면적 추출 실패", owner_name, "", "", "", "", "", str(e)])
+                continue
+
+            # 공시지가 탭 클릭
+            try:
+                price_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//li[contains(text(), '가격')]")))
+                price_tab.click()
+                time.sleep(1)
+            except:
+                print("⚠️ 가격 탭 클릭 실패")
+
+            # 공시지가 추출
+            try:
+                print(f"[STEP] {address} - 공시지가 추출 시도")
+
+                jiga_rows = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "tbody#jigaInfoTbl tr")))
+                valid_jiga_row = None
+
+                for row in jiga_rows:
+                    tds = row.find_elements(By.TAG_NAME, "td")
+                    if len(tds) >= 3:
+                        valid_jiga_row = tds
+                        break
+
+                if valid_jiga_row is None:
+                    print(f"[WARN] {address} - 공시지가 정보 없음")
+                    land_price = "-"
+                else:
+                    land_price = valid_jiga_row[2].text.strip()
+                    print(f"[STEP] {address} - 공시지가: {land_price}")
+
+            except Exception as e:
+                print(f"[ERROR] {address} - 공시지가 추출 실패")
+                traceback.print_exc()
+                land_price = "-"
+
+            print(f"✅ 완료: {owner_type}, {owner_name}, {land_type}, {land_area}, {land_price}")
+
+            ws.append([address, owner_type, owner_name, land_type, land_area, land_price])
+
+        except Exception as e:
+            print(f"❌ {address} 처리 중 오류 발생")
+            traceback.print_exc()
+            ws.append([address, "오류", "조회 실패", "", "", ""])
+
+finally:
+    wb.save(save_path)
+    print(f"\n📁 엑셀 저장 완료: {save_path}")
+    input("⏹️ 엔터를 누르면 브라우저를 닫습니다...")
+    driver.quit()
